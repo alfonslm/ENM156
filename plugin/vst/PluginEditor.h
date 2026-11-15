@@ -3,6 +3,12 @@
 // is, the latency and why audio passes through (if it does). Runs on the
 // message thread only; it talks to the processor through its control calls
 // and parameters, never to the audio thread.
+//
+// Bound to an ARA document, the model and the high-band choice are the
+// document's (shared by all its instances, saved in its ARA archive): the
+// buttons and the high-band box act on the document controller, and the
+// window lists the document's audio sources with their analysis state.
+// Mix and bypass stay this instance's parameters.
 
 #include "PluginProcessor.h"
 
@@ -10,7 +16,9 @@
 
 #include <memory>
 
-class DenoiserEditor final : public juce::AudioProcessorEditor, private juce::ChangeListener {
+class DenoiserEditor final : public juce::AudioProcessorEditor,
+                             private juce::ChangeListener,
+                             private juce::Timer {
 public:
     explicit DenoiserEditor(DenoiserProcessor& owner);
     ~DenoiserEditor() override;
@@ -20,8 +28,11 @@ public:
 
 private:
     void changeListenerCallback(juce::ChangeBroadcaster*) override { refresh(); }
+    void timerCallback() override { refresh(); }
     void refresh();
+    void refreshAra();
     void chooseModel();
+    bool araMode() const;
 
     DenoiserProcessor& processor_;
 
@@ -32,6 +43,8 @@ private:
     juce::Slider mixSlider_{juce::Slider::LinearHorizontal, juce::Slider::TextBoxRight};
     juce::ToggleButton bypassButton_{"Bypass"};
     juce::ComboBox highBandBox_;
+    juce::ComboBox araHighBandBox_;  // the document's setting, in ARA mode
+    juce::TextEditor araSources_;     // the document's sources, in ARA mode
 
     juce::AudioProcessorValueTreeState::SliderAttachment mixAttachment_;
     juce::AudioProcessorValueTreeState::ButtonAttachment bypassAttachment_;
