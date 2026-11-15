@@ -221,6 +221,13 @@ bool isDelayedInput(const Audio& out, const Audio& in, int latency, juce::String
     return true;
 }
 
+// Fails with `label` and the first differing sample unless out == in delayed by `latency`
+void checkDelayed(const Audio& out, const Audio& in, int latency, const juce::String& label) {
+    juce::String where;
+    if (!isDelayedInput(out, in, latency, where))
+        fail(label + where);
+}
+
 constexpr double kTolerance = 1e-5;
 
 struct GoldenModel {
@@ -258,8 +265,7 @@ void testNoModel(Host& host) {
         // The latency of config.toml's model shape (n_fft 128, hop 80), so that
         // loading such a model doesn't change the host's compensation
         check(latency == 669, "no-model latency at 48 kHz should be 669, got " + juce::String(latency));
-        juce::String where;
-        check(isDelayedInput(out, in, latency, where), "no model, " + juce::String(channels) + " ch: " + where);
+        checkDelayed(out, in, latency, "no model, " + juce::String(channels) + " ch: ");
         check(statusMessage(*plugin).contains("No model"), "no-model message: " + statusMessage(*plugin));
     }
 }
@@ -287,9 +293,8 @@ void testLatency(Host& host) {
     // An unsupported rate: pass-through, no latency, a message
     const Audio in = noise(2, 1000, 2);
     const Audio out = render(*plugin, 8000.0, in, 0, fixedBlocks(100));
-    juce::String where;
     check(plugin->getLatencySamples() == 0, "8 kHz latency should be 0");
-    check(isDelayedInput(out, in, 0, where), "8 kHz should pass through: " + where);
+    checkDelayed(out, in, 0, "8 kHz should pass through: ");
     check(statusMessage(*plugin).contains("not supported"), "8 kHz message: " + statusMessage(*plugin));
 }
 
@@ -359,7 +364,6 @@ void testBypassMixState(Host& host) {
     const Audio in = noise(2, 12000, 8);
     const int latency = expectedLatency(48000, *g.model);
     const auto blocks = [] { return pattern({512, 77, 1024}); };
-    juce::String where;
 
     apply(*plugin, {g.path, 1.0f});
     const Audio wet = render(*plugin, 48000.0, in, latency, blocks());
@@ -368,11 +372,11 @@ void testBypassMixState(Host& host) {
     apply(*plugin, {g.path, 1.0f, true});
     const Audio bypassed = render(*plugin, 48000.0, in, latency, blocks());
     check(plugin->getLatencySamples() == latency, "bypass keeps the latency");
-    check(isDelayedInput(bypassed, in, latency, where), "bypass != input delayed by the latency: " + where);
+    checkDelayed(bypassed, in, latency, "bypass != input delayed by the latency: ");
 
     apply(*plugin, {g.path, 0.0f});
     const Audio dry = render(*plugin, 48000.0, in, latency, blocks());
-    check(isDelayedInput(dry, in, latency, where), "mix 0 != bypass: " + where);
+    checkDelayed(dry, in, latency, "mix 0 != bypass: ");
 
     apply(*plugin, {g.path, 0.5f});
     const Audio half = render(*plugin, 48000.0, in, latency, blocks());
@@ -390,7 +394,7 @@ void testBypassMixState(Host& host) {
         bypass->setValue(1.0f);
         render(*plugin, 48000.0, noise(2, 64, 1), 0, fixedBlocks(64));  // delivers the change
         const Audio hostBypassed = render(*plugin, 48000.0, in, latency, blocks());
-        check(isDelayedInput(hostBypassed, in, latency, where), "host bypass != delayed input: " + where);
+        checkDelayed(hostBypassed, in, latency, "host bypass != delayed input: ");
         bypass->setValue(0.0f);
         render(*plugin, 48000.0, noise(2, 64, 1), 0, fixedBlocks(64));
         const Audio back = render(*plugin, 48000.0, in, latency, blocks());
@@ -421,7 +425,6 @@ void testUnusableModels(Host& host) {
     if (!plugin)
         return;
     const Audio in = noise(2, 4000, 9);
-    juce::String where;
 
     // Missing file: the shape saved with it keeps the latency it had
     apply(*plugin, {golden("no_such_model.model.bin"), 1.0f, false, false, 64, 128});
@@ -430,20 +433,20 @@ void testUnusableModels(Host& host) {
     check(plugin->getLatencySamples() == latency, "missing model latency " +
                                                       juce::String(plugin->getLatencySamples()) + ", expected " +
                                                       juce::String(latency));
-    check(isDelayedInput(out, in, plugin->getLatencySamples(), where), "missing model: " + where);
+    checkDelayed(out, in, plugin->getLatencySamples(), "missing model: ");
     check(statusMessage(*plugin).contains("not found"), "missing model message: " + statusMessage(*plugin));
 
     // A broken file
     apply(*plugin, {golden("index.json")});
     out = render(*plugin, 48000.0, in, 800, fixedBlocks(480));
-    check(isDelayedInput(out, in, plugin->getLatencySamples(), where), "broken model: " + where);
+    checkDelayed(out, in, plugin->getLatencySamples(), "broken model: ");
     check(statusMessage(*plugin).contains("Could not load"), "broken model message: " + statusMessage(*plugin));
 
     // Centred (offline-only) model
     apply(*plugin, {golden("offline_mlp_mask_centred.model.bin")});
     out = render(*plugin, 48000.0, in, 800, fixedBlocks(480));
     check(plugin->getLatencySamples() == 669, "centred model latency");
-    check(isDelayedInput(out, in, plugin->getLatencySamples(), where), "centred model: " + where);
+    checkDelayed(out, in, plugin->getLatencySamples(), "centred model: ");
     check(statusMessage(*plugin).contains("centred"), "centred model message: " + statusMessage(*plugin));
 }
 
