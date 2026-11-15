@@ -97,7 +97,7 @@ void DenoiserProcessor::prepareToPlay(double sampleRate, int maximumExpectedSamp
     // callback lock makes sure of it with the JUCE VST3 wrapper.
     Engine *oldActive = nullptr, *oldFading = nullptr, *oldPending = nullptr;
     {
-        const juce::ScopedLock callbackLock(getCallbackLock());
+        const juce::ScopedLock heldCallbackLock(getCallbackLock());
         oldActive = std::exchange(active_, engine.release());
         oldFading = std::exchange(fading_, nullptr);
         oldPending = pending_.exchange(nullptr);
@@ -123,7 +123,7 @@ void DenoiserProcessor::releaseResources() {
     prepared_ = false;
     Engine *oldActive = nullptr, *oldFading = nullptr, *oldPending = nullptr;
     {
-        const juce::ScopedLock callbackLock(getCallbackLock());
+        const juce::ScopedLock heldCallbackLock(getCallbackLock());
         oldActive = std::exchange(active_, nullptr);
         oldFading = std::exchange(fading_, nullptr);
         oldPending = pending_.exchange(nullptr);

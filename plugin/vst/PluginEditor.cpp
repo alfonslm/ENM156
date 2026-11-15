@@ -1,15 +1,15 @@
 #include "PluginEditor.h"
 
-DenoiserEditor::DenoiserEditor(DenoiserProcessor& processor)
-    : AudioProcessorEditor(processor),
-      processor_(processor),
-      mixAttachment_(processor.parameters(), DenoiserProcessor::kMixId, mixSlider_),
-      bypassAttachment_(processor.parameters(), DenoiserProcessor::kBypassId, bypassButton_) {
+DenoiserEditor::DenoiserEditor(DenoiserProcessor& owner)
+    : AudioProcessorEditor(owner),
+      processor_(owner),
+      mixAttachment_(owner.parameters(), DenoiserProcessor::kMixId, mixSlider_),
+      bypassAttachment_(owner.parameters(), DenoiserProcessor::kBypassId, bypassButton_) {
     // The combo box must have its items before the attachment is made
     highBandBox_.addItem("Drop (model band only, up to ~7.5 kHz)", 1);
     highBandBox_.addItem("Pass through (unprocessed, noise stays)", 2);
     highBandAttachment_ = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
-        processor.parameters(), DenoiserProcessor::kHighBandId, highBandBox_);
+        processor_.parameters(), DenoiserProcessor::kHighBandId, highBandBox_);
 
     loadButton_.onClick = [this] { chooseModel(); };
     clearButton_.onClick = [this] { processor_.clearModel(); };

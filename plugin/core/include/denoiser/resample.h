@@ -82,8 +82,8 @@ public:
     // Polyphase tables, each phase's taps stored oldest-sample-first
     int downTaps() const noexcept { return downTaps_; }  // per phase, L phases
     int upTaps() const noexcept { return upTaps_; }      // per phase, M phases
-    const float* downPhase(int phase) const noexcept { return downTable_.data() + std::size_t(phase) * downTaps_; }
-    const float* upPhase(int phase) const noexcept { return upTable_.data() + std::size_t(phase) * upTaps_; }
+    const float* downPhase(int phase) const noexcept { return downTable_.data() + std::size_t(phase) * std::size_t(downTaps_); }
+    const float* upPhase(int phase) const noexcept { return upTable_.data() + std::size_t(phase) * std::size_t(upTaps_); }
 
 private:
     ResampleFilter() = default;

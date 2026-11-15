@@ -12,7 +12,7 @@
 
 class DenoiserEditor final : public juce::AudioProcessorEditor, private juce::ChangeListener {
 public:
-    explicit DenoiserEditor(DenoiserProcessor& processor);
+    explicit DenoiserEditor(DenoiserProcessor& owner);
     ~DenoiserEditor() override;
 
     void paint(juce::Graphics& g) override;

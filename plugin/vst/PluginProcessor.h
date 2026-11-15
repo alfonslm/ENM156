@@ -64,6 +64,9 @@ public:
     using juce::AudioProcessor::processBlock;
     using juce::AudioProcessor::processBlockBypassed;
     juce::AudioProcessorParameter* getBypassParameter() const override;
+#if JucePlugin_Enable_ARA
+    juce::AudioProcessorARAExtension* getARAClientExtensions() override { return this; }
+#endif
 
     bool hasEditor() const override { return true; }
     juce::AudioProcessorEditor* createEditor() override;

@@ -44,8 +44,8 @@ target_link_libraries(DenoiserPlugin
         juce::juce_recommended_lto_flags
         juce::juce_recommended_warning_flags)
 
-# A minimal headless host that loads the built VST3 and checks that audio
-# passes through unchanged (ctest: plugin_passthrough)
+# A minimal headless host that loads the built VST3 and checks the real-time
+# denoiser through the plugin interface (ctest: plugin_vst3)
 if(DENOISER_BUILD_TESTS)
     juce_add_console_app(denoiser_plugin_host_test
         PRODUCT_NAME "denoiser_plugin_host_test"
@@ -61,6 +61,7 @@ if(DENOISER_BUILD_TESTS)
             JUCE_USE_CURL=0)
     target_link_libraries(denoiser_plugin_host_test
         PRIVATE
+            denoiser::core
             juce::juce_audio_processors_headless
             juce::juce_events
         PUBLIC
@@ -70,6 +71,6 @@ if(DENOISER_BUILD_TESTS)
     add_dependencies(denoiser_plugin_host_test DenoiserPlugin_VST3)
 
     get_target_property(denoiser_vst3_bundle DenoiserPlugin_VST3 JUCE_PLUGIN_ARTEFACT_FILE)
-    add_test(NAME plugin_passthrough
-        COMMAND denoiser_plugin_host_test "${denoiser_vst3_bundle}")
+    add_test(NAME plugin_vst3
+        COMMAND denoiser_plugin_host_test "${denoiser_vst3_bundle}" "${PROJECT_SOURCE_DIR}/tests/golden")
 endif()
