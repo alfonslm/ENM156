@@ -78,14 +78,24 @@ private:
 // lowpass whose coefficient depends on the hop's energy
 class Weird : public HopProcessor {
 public:
+    // Its output is compared bit for bit between two call sites, so the
+    // arithmetic must not depend on how the compiler fuses "a * b + c" into
+    // one multiply-add: that can differ between an inlined and an out-of-line
+    // copy of the same function (it did with Clang on arm64, where the energy
+    // sum this used to compute was fused in one copy and not in the other).
+    // Every product here is by a power of two, which is exact, so fusing it
+    // into the following addition cannot change the result.
     void processHop(const float* in, float* out, int hop) noexcept override {
-        float e = 0.0f;
+        float peak = 0.0f;
         for (int i = 0; i < hop; ++i)
-            e += in[i] * in[i];
-        const float a = 0.5f + 0.4f * std::tanh(e);
+            peak = std::max(peak, std::fabs(in[i]));
+        // Depends on the whole hop, so a hop cut at the wrong sample shows up;
+        // 0.59 is about the median hop peak of the test signals, so both
+        // values are used about equally often
+        const float a = peak > 0.59f ? 0.5f : 0.25f;
         for (int i = 0; i < hop; ++i) {
-            s_ = a * s_ + (1.0f - a) * in[i];
-            out[i] = s_ + 0.1f * in[i];
+            s_ = a * (s_ + in[i]);
+            out[i] = s_ + 0.125f * in[i];
         }
     }
     void reset() noexcept override { s_ = 0.0f; }
