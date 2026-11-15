@@ -629,7 +629,12 @@ only on Linux/glibc, the test hook through an environment variable set with
   times (this found two races in the test itself, now fixed, and the case of
   a renderer prepared while the analysis was busy staying silent instead of
   playing the original, now fixed in the plugin).
-- **ThreadSanitizer**: TSAN_PLACEHOLDER
+- **ThreadSanitizer** (RelWithDebInfo, JUCE, the plugin and the tests all
+  instrumented): `plugin_ara` 4 times (including the test that renders on a
+  separate audio thread, ~5 000-6 000 blocks while the model, the high band
+  and a source's samples change 8 times) and `plugin_ara_engine` with a 10 s
+  `AudioSlot` stress (68 707 publications during 500 092 blocks on two
+  rendering threads): **no reports**.
 - **Steinberg's VST3 validator** 3.8.0 on the Release build: **47 / 47 passed**.
 - **pluginval 1.0.4, strictness 10, including its GUI tests under Xvfb**:
   **SUCCESS** (no model; these tools don't bind ARA, so they test the
