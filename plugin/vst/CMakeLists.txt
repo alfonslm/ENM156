@@ -27,6 +27,7 @@ target_sources(DenoiserPlugin
         PluginProcessor.cpp
         PluginEditor.cpp
         RealtimeEngine.cpp
+        AraEngine.cpp
         DocumentController.cpp)
 
 target_compile_definitions(DenoiserPlugin
@@ -117,4 +118,21 @@ if(DENOISER_BUILD_TESTS)
     add_test(NAME plugin_processor_alloc COMMAND denoiser_processor_test alloc "${golden_dir}")
     add_test(NAME plugin_processor_core COMMAND denoiser_processor_test core "${golden_dir}")
     add_test(NAME plugin_processor_stress COMMAND denoiser_processor_test stress "${golden_dir}" 2)
+endif()
+
+# The ARA engine below the ARA interface (analysis, stored audio, region
+# rendering): plain C++, no JUCE (ctest: plugin_ara_engine)
+if(DENOISER_BUILD_TESTS)
+    add_executable(denoiser_ara_engine_test AraEngineTest.cpp AraEngine.cpp)
+    target_link_libraries(denoiser_ara_engine_test PRIVATE denoiser::core)
+    find_package(Threads REQUIRED)
+    target_link_libraries(denoiser_ara_engine_test PRIVATE Threads::Threads)
+    target_compile_definitions(denoiser_ara_engine_test
+        PRIVATE DENOISER_COUNT_ALLOCATIONS=$<BOOL:${DENOISER_PROCESSOR_TEST_COUNT_ALLOCATIONS}>)
+    if(MSVC)
+        target_compile_options(denoiser_ara_engine_test PRIVATE /W4)
+    else()
+        target_compile_options(denoiser_ara_engine_test PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Wconversion)
+    endif()
+    add_test(NAME plugin_ara_engine COMMAND denoiser_ara_engine_test "${PROJECT_SOURCE_DIR}/tests/golden" 1)
 endif()
