@@ -25,6 +25,26 @@
 #include <memory>
 #include <vector>
 
+// On Linux (glibc) the counting operator new / malloc of this executable are
+// also the ones the dlopen()ed plugin calls, so the whole processing call is
+// counted: JUCE's VST3 hosting, JUCE's VST3 wrapper and the processor
+// (not under sanitizers, which have their own allocator)
+#define DENOISER_COUNT_WRAPPER_ALLOCATIONS 0
+#if defined(__linux__) && defined(__GLIBC__) && !defined(__SANITIZE_ADDRESS__) && !defined(__SANITIZE_THREAD__)
+#if defined(__has_feature)
+#if !__has_feature(address_sanitizer) && !__has_feature(thread_sanitizer) && !__has_feature(memory_sanitizer)
+#undef DENOISER_COUNT_WRAPPER_ALLOCATIONS
+#define DENOISER_COUNT_WRAPPER_ALLOCATIONS 1
+#endif
+#else
+#undef DENOISER_COUNT_WRAPPER_ALLOCATIONS
+#define DENOISER_COUNT_WRAPPER_ALLOCATIONS 1
+#endif
+#endif
+#if DENOISER_COUNT_WRAPPER_ALLOCATIONS
+#include "../tests/alloc_hooks.h"
+#endif
+
 namespace {
 
 using Audio = std::vector<std::vector<float>>;  // planar
@@ -419,6 +439,56 @@ void testBypassMixState(Host& host) {
     check(relErr(before, wet) > 1e-4, "mix 0.7 + high band should differ from the wet output");
 }
 
+#if DENOISER_COUNT_WRAPPER_ALLOCATIONS
+// No heap allocation (or free) anywhere in a processing call through the
+// VST3 interface, both sides of it, including across a model swap
+void testWrapperAllocations(Host& host) {
+    std::printf("allocations in processBlock through the VST3 interface (host + wrapper + plugin)\n");
+    int* probe = nullptr;
+    check(alloc::countOnThisThread([&] { probe = new int(1); }) >= 1, "the allocation counter doesn't work");
+    delete probe;
+    auto plugin = host.create(2);
+    if (!plugin)
+        return;
+    apply(*plugin, {golden("mlp_magnitude_default.model.bin")});
+    plugin->releaseResources();
+    plugin->prepareToPlay(48000.0, 512);
+    std::vector<float> left(512), right(512);
+    float* data[] = {left.data(), right.data()};
+    juce::MidiBuffer midi;
+    juce::Random random(10);
+    const auto run = [&](int blocks) {
+        return alloc::countOnThisThread([&] {
+            for (int b = 0; b < blocks; ++b) {
+                const int n = 1 + random.nextInt(512);
+                for (int i = 0; i < n; ++i)
+                    left[size_t(i)] = right[size_t(i)] = random.nextFloat() - 0.5f;
+                juce::AudioBuffer<float> buffer(data, 2, n);
+                plugin->processBlock(buffer, midi);
+            }
+        });
+    };
+    run(20);  // warm-up: first calls may set things up lazily
+    long count = run(300);
+    std::printf("  steady state: %ld\n", count);
+    check(count == 0, "processing through the VST3 interface allocated " + juce::String(count) + " times");
+    // A model swap prepared by restoring a state (allocates, outside the count)
+    apply(*plugin, {golden("tcn_magnitude_default.model.bin")});
+    count = run(300);
+    std::printf("  across a model swap: %ld\n", count);
+    check(count == 0, "processing across a model swap allocated " + juce::String(count) + " times");
+    // Parameter automation from the host
+    count = alloc::countOnThisThread([&] {
+        if (auto* bypass = plugin->getBypassParameter())
+            bypass->setValue(1.0f);
+    });
+    const long paramCount = count;
+    count = run(50);
+    std::printf("  setting a parameter: %ld, processing it: %ld\n", paramCount, count);
+    check(count == 0, "processing a parameter change allocated " + juce::String(count) + " times");
+}
+#endif
+
 void testUnusableModels(Host& host) {
     std::printf("missing and offline-only models: pass-through with a message\n");
     auto plugin = host.create(2);
@@ -483,6 +553,9 @@ int main(int argc, char** argv) {
         testBlockSizes(host);
         testBypassMixState(host);
         testUnusableModels(host);
+#if DENOISER_COUNT_WRAPPER_ALLOCATIONS
+        testWrapperAllocations(host);
+#endif
     } catch (const std::exception& e) {
         fail(juce::String("exception: ") + e.what());
     }
