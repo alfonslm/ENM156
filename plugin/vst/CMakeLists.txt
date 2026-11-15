@@ -25,6 +25,8 @@ juce_add_plugin(DenoiserPlugin
 target_sources(DenoiserPlugin
     PRIVATE
         PluginProcessor.cpp
+        PluginEditor.cpp
+        RealtimeEngine.cpp
         DocumentController.cpp)
 
 target_compile_definitions(DenoiserPlugin
