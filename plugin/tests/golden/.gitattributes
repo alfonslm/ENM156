@@ -1,0 +1,2 @@
+# Raw float32 data: never convert line endings or diff as text
+*.bin binary

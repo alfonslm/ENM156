@@ -1,0 +1,9 @@
+# Build folders (dependencies are fetched into <build>/_deps)
+/build/
+/build-*/
+/cmake-build-*/
+/out/
+# Editor / tool state
+/.cache/
+/compile_commands.json
+CMakeUserPresets.json
