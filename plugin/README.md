@@ -280,3 +280,43 @@ reports at 16 kHz.
   second of audio** (0.3 % of one core) for option A, 4.8 ms for B; 44.1 kHz
   about the same.
 - The tests also pass under AddressSanitizer + UBSan (Debug).
+
+## Incremental TCN (`core/include/denoiser/tcn.h`)
+
+`TcnNetwork` (a `FrameNetwork`; `makeTcnNetwork(model)`) evaluates the TCN
+one frame per `process()` call: per block a ring of its last
+`(kernel − 1) · dilation` frames of `relu(LayerNorm(block input))`, plus the
+current frame, is all the dilated convolution reads. The start-up
+`FrameModel.forward` does (`context − 1` zero input frames) runs once when the
+weights are loaded (`TcnModel`); `reset()` copies that snapshot back.
+Weights (`TcnModel`, immutable) can be shared between instances, e.g. one per
+channel: `std::make_shared<const TcnModel>(model)`.
+
+Kernels: weights stored transposed (`[in][out]`, the dilated conv as
+`[tap][in][out]`), so every layer is a sum of weight rows scaled by its
+inputs, eight rows at a time; rows of inputs that are exactly zero (after a
+ReLU, about half) are skipped. Plain loops, vectorised by GCC/Clang/MSVC
+without fast-math; no BLAS.
+
+Measured (`bench_tcn`, Release, GCC 13, generic x86-64 flags, one thread,
+Intel Xeon @ 2.3 GHz shared VM, 2 MB L2 per core; best of 21 runs, the median
+is up to 1.5× slower on this noisy machine), config.toml's default size (n_in
+130, 256 channels, kernel 3, dilations 1–32, n_out 65; 1.62 M multiply-adds
+and 6.5 MB of weights per frame), random weights:
+
+| | µs per frame | frames/s | real-time factor at 200 frames/s |
+|---|---|---|---|
+| random weights (~half the ReLU outputs zero) | 150–200 | 5000–6500 | **25–33×** |
+| worst case: nothing zero, every row read | 230–340 | 2900–4300 | **15–22×** |
+| `reset()` | 2.6 | | (copies 129 kB) |
+| the straightforward start-up it replaces (126 frames) | 21 000–43 000 | | |
+
+`-march=x86-64-v3` (AVX2, FMA) gains little (~10 %): the loop streams 6.5 MB
+of weights per frame from L3, so it is bound by memory bandwidth, not
+arithmetic. Clang 18 is in the same range. Per instance: 129 kB of state plus
+~3 kB scratch; per model: 6.5 MB of weights plus the 129 kB snapshot.
+
+Tests: `tests/test_tcn.cpp` (golden `pred` and `tcn.h*` from the first frame,
+streamed and offline end to end, reset and start-up equivalence, a
+brute-force double-precision reference for other kernels/dilations and clips
+shorter than the context, malformed headers), `tests/test_tcn_alloc.cpp`.
