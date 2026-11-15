@@ -16,8 +16,8 @@ controller come in later issues.
 
 ## Decisions
 
-These are the proposed defaults from the decision issue. Nobody objected to
-them, and **merging the pull request that adds this file confirms them.**
+These are the proposed defaults from the decision issue, taken from its
+recommendations. **Merging the pull request that adds this file confirms them.**
 
 | | choice | why |
 |---|---|---|
