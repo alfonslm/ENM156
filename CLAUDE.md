@@ -26,12 +26,14 @@ behaviour changes.
   files in `plugin/tools/` that import `denoiser/` without changing it.
 - Do not edit the existing Python project (`denoiser/`, `train*.py`,
   `evaluate.py`, `config.toml`, `tests/`, the root `README.md`) in the fork.
-  A fix or change there goes upstream first.
+  A fix or change there goes upstream first. The owner made one exception:
+  five review fixes (pull request 14), each its own commit so it can be
+  offered upstream.
 
 ## Checks
 
 ```bash
-# Python: six scripts, no dataset needed
+# Python: every script in tests/, no dataset needed
 for t in tests/test_*.py; do .venv/bin/python "$t" || break; done
 
 # C++ core, command-line tool and tests (seconds)
@@ -62,8 +64,16 @@ When work is split between several agents:
   approval from the account that opened a pull request, so the approval is
   recorded as a review comment.)
 - After its pull request is approved and merged, the worker **cleans up
-  after itself**: its worktree, its local and remote branch, its build
-  folders and any scratch files. A finished worker leaves nothing behind.
+  after itself**, so that a finished worker leaves nothing behind. In
+  practice this takes three hands, because a worker cannot do all of it:
+  - the worker removes its build folders and every scratch file it made;
+  - the session that started it removes the worker's worktree and local
+    branch from the main checkout, after checking the branch is fully merged
+    (a worker's isolation does not let it touch anything outside its own
+    worktree);
+  - the remote branch is removed by GitHub's "Automatically delete head
+    branches" setting, or by the owner. Cloud sessions are refused branch
+    deletion (HTTP 403); do not work around that.
 
 ## Things that have already gone wrong once
 
