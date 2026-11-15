@@ -1,6 +1,7 @@
 // Tests on the processor class itself, without a plugin host (the processor
 // sources are compiled into this program; ARA is off here):
 //
+//   denoiser_processor_test bench <model.bin|none>...   CPU use at 48 kHz stereo (not a test)
 //   denoiser_processor_test alloc   <golden dir>   no heap allocation in processBlock, across model swaps
 //   denoiser_processor_test core    <golden dir>   high band vs the core's HighBand options; what a swap does
 //   denoiser_processor_test stress  <golden dir> [seconds]
@@ -359,14 +360,61 @@ void testStress(double seconds) {
     p->releaseResources();
 }
 
+// CPU use of processBlock at 48 kHz stereo, blocks of 512, for model files
+// given on the command line (not a test; see README.md for the numbers)
+void bench(const std::vector<juce::String>& files, double seconds) {
+    const int rate = 48000, block = 512, channels = 2;
+    const int blocks = int(seconds * rate / block);
+    std::vector<float> left(block), right(block);
+    float* data[] = {left.data(), right.data()};
+    juce::Random random(5);
+    juce::MidiBuffer midi;
+    for (const juce::String& file : files) {
+        for (bool highPass : {false, true}) {
+            auto p = makeProcessor(channels);
+            if (file != "none")
+                p->loadModelFile(juce::File::getCurrentWorkingDirectory().getChildFile(file));
+            setParam(*p, DenoiserProcessor::kHighBandId, highPass ? 1.0f : 0.0f);
+            p->prepareToPlay(rate, block);
+            double best = 1e30;
+            for (int run = 0; run < 3; ++run) {
+                p->reset();
+                double total = 0.0;
+                for (int b = 0; b < blocks; ++b) {
+                    juce::AudioBuffer<float> buffer(data, channels, block);
+                    fillNoise(buffer, random);
+                    const auto t0 = std::chrono::steady_clock::now();
+                    p->processBlock(buffer, midi);
+                    total += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                }
+                best = std::min(best, total);
+            }
+            const auto s = p->getStatus();
+            std::printf("%s, high band %s: %.2f %% of one core (%.1f ms per second of audio); %s\n",
+                        file.toRawUTF8(), highPass ? "pass" : "drop", 100.0 * best / seconds, 1000.0 * best / seconds,
+                        s.denoising ? s.description.toRawUTF8() : "pass-through");
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::printf("usage: %s alloc|core|stress <golden dir> [seconds]\n", argv[0]);
+        std::printf("usage: %s alloc|core|stress <golden dir> [seconds]\n"
+                    "       %s bench <model.bin|none>...\n",
+                    argv[0], argv[0]);
         return 2;
     }
     const juce::String mode = argv[1];
+    if (mode == "bench") {
+        juce::ScopedJuceInitialiser_GUI juce;
+        std::vector<juce::String> files;
+        for (int i = 2; i < argc; ++i)
+            files.push_back(juce::String::fromUTF8(argv[i]));
+        bench(files, 10.0);
+        return 0;
+    }
     goldenDir = juce::File::getCurrentWorkingDirectory().getChildFile(juce::String::fromUTF8(argv[2]));
     juce::ScopedJuceInitialiser_GUI juce;
 

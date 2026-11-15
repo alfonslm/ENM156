@@ -54,8 +54,9 @@ struct ModelShape {
 class Engine {
 public:
     // Allocates; never throws for bad input (rate, model): the reason is in
-    // message() and the engine passes audio through. Only std::bad_alloc
-    // escapes. `model` may be null.
+    // message() and the engine passes audio through (also if building the
+    // denoisers runs out of memory; std::bad_alloc can still escape from the
+    // small pass-through buffers). `model` may be null.
     static std::unique_ptr<Engine> create(std::shared_ptr<const denoiser::Model> model, int hostRate,
                                           int channels, ModelShape shape);
 

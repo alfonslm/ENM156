@@ -55,8 +55,8 @@ std::unique_ptr<Engine> Engine::create(std::shared_ptr<const denoiser::Model> mo
                 e->nullRoundTrip_.prepare(config);  // no processors: the built-in pass-through
             e->latency_ = e->adapter_.latencySamples();
             e->model_ = std::move(model);
-        } catch (const std::invalid_argument& error) {
-            // Not expected for a model that loaded (the rate was checked above)
+        } catch (const std::exception& error) {
+            // Not expected for a model that loaded (the rate was checked above), or out of memory
             e->denoisers_.clear();
             e->message_ = std::string("The model can't run at this rate: ") + error.what() + ". Audio passes through.";
         }
