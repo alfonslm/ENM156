@@ -581,11 +581,11 @@ void DenoiserDocumentController::runJob(Source& source, unsigned job) {
             return;  // not read yet: the read comes with the next job
         }
         if ((job & kDenoise) != 0) {
+            if (model)
+                setStatus(source, SourceState::Denoising, 0.0f, {});
             const juce::File hold = testHoldFile();
             while (hold != juce::File() && hold.exists() && !source.cancel.load() && !stop_)
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            if (model)
-                setStatus(source, SourceState::Denoising, 0.0f, {});
             const Outcome outcome = source.analysis.denoise(model, [&](float fraction) {
                 if (source.cancel.load() || stop_)
                     return false;

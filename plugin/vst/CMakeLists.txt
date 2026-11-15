@@ -3,6 +3,8 @@
 juce_add_plugin(DenoiserPlugin
     PRODUCT_NAME "ENM156 Denoiser"
     COMPANY_NAME "ENM156"
+    # ARA requires an information URL in its factory
+    COMPANY_WEBSITE "https://github.com/supersonic-lumina/ENM156"
     BUNDLE_ID org.enm156.denoiser
     PLUGIN_MANUFACTURER_CODE Enms   # four characters, at least one upper-case
     PLUGIN_CODE Dnz1                # four characters, exactly one upper-case
@@ -81,6 +83,35 @@ if(DENOISER_BUILD_TESTS)
     get_target_property(denoiser_vst3_bundle DenoiserPlugin_VST3 JUCE_PLUGIN_ARTEFACT_FILE)
     add_test(NAME plugin_vst3
         COMMAND denoiser_plugin_host_test "${denoiser_vst3_bundle}" "${PROJECT_SOURCE_DIR}/tests/golden")
+endif()
+
+# A headless ARA host (JUCE's ARA hosting classes + the ARA SDK's host
+# dispatch library) that drives the built VST3 through the ARA interface
+# (ctest: plugin_ara)
+if(DENOISER_BUILD_TESTS AND DENOISER_ENABLE_ARA)
+    juce_add_console_app(denoiser_ara_host_test
+        PRODUCT_NAME "denoiser_ara_host_test"
+        NEEDS_WEB_BROWSER FALSE
+        NEEDS_CURL FALSE)
+    target_sources(denoiser_ara_host_test PRIVATE AraHostTest.cpp)
+    target_compile_definitions(denoiser_ara_host_test
+        PRIVATE
+            JUCE_PLUGINHOST_VST3=1
+            JUCE_PLUGINHOST_ARA=1
+            JUCE_WEB_BROWSER=0
+            JUCE_USE_CURL=0)
+    target_link_libraries(denoiser_ara_host_test
+        PRIVATE
+            denoiser::core
+            juce::juce_audio_processors_headless
+            juce::juce_events
+        PUBLIC
+            juce::juce_recommended_config_flags
+            juce::juce_recommended_warning_flags)
+    add_dependencies(denoiser_ara_host_test DenoiserPlugin_VST3)
+    add_test(NAME plugin_ara
+        COMMAND denoiser_ara_host_test "${denoiser_vst3_bundle}" "${PROJECT_SOURCE_DIR}/tests/golden"
+                "${CMAKE_CURRENT_BINARY_DIR}/ara_work")
 endif()
 
 # The processor class tested directly, without a plugin host: its sources

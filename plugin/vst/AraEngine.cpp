@@ -98,7 +98,10 @@ Outcome SourceAnalysis::denoise(const std::shared_ptr<const denoiser::Model>& mo
         return Outcome::Empty;
     }
     if (x16_.empty()) {
-        message_ = "Sample rate " + std::to_string(rate_) +
+        const double rounded = std::round(rate_);
+        const std::string rate = std::fabs(rounded - rate_) < 1e-9 && rounded < 1e9 ? std::to_string(std::llround(rate_))
+                                                                   : std::to_string(rate_);
+        message_ = "Sample rate " + rate +
                    " Hz is not supported (16 to 384 kHz, e.g. 44.1, 48, 96 kHz): the original plays.";
         return Outcome::UnsupportedRate;
     }
