@@ -17,10 +17,14 @@ denoiser in real time (see "The VST3 effect" below): model file chosen in its
 window and saved in the session, mix, latency-compensated bypass, high-band
 switch, exact latency, no allocation or locks on the audio thread, tested
 headlessly through its VST3 interface and checked with Steinberg's validator
-and pluginval (strictness 10). It has **not** been tried in a DAW yet (there
-is none in the development environment; a checklist is below). The ARA
-document controller (offline, whole clips) comes in a later issue; bound to
-ARA the plugin still outputs silence.
+and pluginval (strictness 10). Bound to an ARA document (see "ARA: whole
+clips" below), the same binary denoises whole audio sources offline, on a
+background thread, at the source's rate, with causal and centred
+(non-causal) models, and plays them back sample-aligned with no latency
+(milestone M3); tested through the real ARA interface by a headless ARA host
+built on JUCE's ARA hosting classes, and with the ARA SDK's `ARATestHost`.
+Neither mode has been tried in a DAW yet (there is none in the development
+environment); checklists for the owner are below.
 
 ## Decisions
 
@@ -137,7 +141,12 @@ a local clone of the same version: `-DFETCHCONTENT_SOURCE_DIR_JUCE=/path/to/JUCE
 - `ctest` in a plugin build also runs `plugin_vst3` (a small headless host,
   `vst/HostTest.cpp`, loads the built `.vst3` with JUCE's VST3 hosting and
   checks the denoiser through it) and `plugin_processor_*` (the processor
-  class without a host); see "The VST3 effect", "Tests".
+  class without a host); see "The VST3 effect", "Tests". With ARA (the
+  default) also `plugin_ara` (a headless ARA host, `vst/AraHostTest.cpp`) and
+  `plugin_ara_engine` (the ARA engine without JUCE); see "ARA: whole clips",
+  "Tests".
+- The ARA SDK's own `ARATestHost` (in `ARA_Examples`) can be pointed at the
+  plugin; see "ARA: whole clips", "What was run".
 - Steinberg's validator (from the VST3 SDK, MIT, tag `v3.8.0_build_66`) can be
   built with `-DSMTG_ENABLE_VST3_PLUGIN_EXAMPLES=OFF -DSMTG_ENABLE_VSTGUI_SUPPORT=OFF`
   and target `validator` (on Linux its hosting examples also need
@@ -286,6 +295,9 @@ be added later (the state format has a `version` attribute for that).
   `parameters()` the settings. The processor is a `juce::ChangeBroadcaster`
   that sends a change message (on the message thread) whenever the model or
   the status changes. `processBlockForARA` still comes first in `processBlock`.
+  (In the end the ARA side keeps its own, document-wide model and does not
+  use the instance's: see "ARA: whole clips", "Where the model and the
+  settings live". It uses `mixParam_` / `bypassParam_` directly.)
 
 ### Tests (ctest, in a plugin build; all headless, ~10 s in Release)
 
@@ -401,8 +413,370 @@ Bitwig):
 8. Load a model while playing (and change models repeatedly): no drop-out
    or click, at most a short crossfade.
 9. Hosts that bind the plugin through ARA (e.g. as an item / take effect in
-   REAPER, or as an ARA extension in Studio One / Cubase) get the ARA path,
-   which is the next issue: bound to ARA it currently outputs silence.
+   REAPER, or as an ARA extension in Studio One / Cubase) get the ARA path
+   instead: see "ARA: whole clips" and its own checklist below.
+
+## ARA: whole clips
+
+`vst/DocumentController.*` (the ARA document controller and playback
+renderer), `vst/AraEngine.*` (everything below the ARA interface, no JUCE),
+`core/include/denoiser/offline_rate.h` (whole clips at any rate). Bound to an
+ARA document, the plugin denoises every audio source of the document as a
+whole clip, like `pipeline.enhance()`, on a background thread, and plays the
+result back in place of the regions' audio: no latency, sample-aligned with
+the source, causal and centred (`realtime: false`) models alike.
+
+### What happens to a source
+
+1. The host creates the audio source and enables sample access. When it ends
+   that edit, the analysis thread reads the whole source through the host's
+   audio reader (32-bit float, in chunks of 65 536 samples, at most two
+   channels kept). From then on the **original** plays.
+2. Each channel is resampled to 16 kHz (`clipToModelRate`; skipped at
+   16 kHz), denoised as one clip (`denoiseClip`, the CLI's offline path:
+   causal or centred framing from the clip's first sample), and resampled
+   back to the source's rate (`clipFromModelRate`), aligned: the filters'
+   delays are removed, the result has the source's length. With the high
+   band passed through, the input minus its own round trip through 16 kHz is
+   added (as the real-time plugin does). The whole chain is
+   `denoiseClipAtRate`, which is also `denoise --resample` (see the CLI).
+3. The denoised audio replaces the original for every region of that source
+   (atomically, see below). Progress goes to the host through ARA's
+   analysis-progress notifications (started, updated about every 1 %,
+   completed) and to the plugin's window.
+
+It is done again when the host reports that the source's samples changed
+(`updateAudioSourceContent` with samples affected, or new properties: rate,
+length, channels), when the document's model changes (network only; the
+source is not read again) and when the high-band choice changes (no network
+run: the 16 kHz result is kept and only resampled again). A running analysis
+that becomes out of date is cancelled (checked every frame and every read
+chunk). Until the new result is there, the previous one keeps playing; after a
+content change the original plays (the old result is wrong for the new
+samples). Disabling sample access destroys the reader (ARA's rule; a read in
+progress stops and starts again when access returns).
+
+| situation | what plays | message (window / state) |
+|---|---|---|
+| no model chosen | the original | "No model chosen: the original audio plays. ..." |
+| the model file is missing / unreadable / not a model | the original | "Model file not found: <path>. ..." / "Could not load ..." |
+| a centred model, source shorter than it needs (half its widest window at 16 kHz, 641 samples for the golden one) | the original | "Too short for this model (it needs at least ... samples at 16 kHz ...)" |
+| a zero-length source | nothing | "Empty audio source." |
+| source rate not supported (below 16 kHz, or e.g. 47 999 Hz) | the original (at its own rate) | "Sample rate 8000 Hz is not supported ..." |
+| more than two channels | the first two | "Only the first 2 of N channels are played." |
+| longer than the limit (below) or out of memory | silence | "Too long to analyse ..." / "Out of memory ..." |
+| the host fails to read | silence | "The host could not read this source's audio ..." |
+
+### Design: classes and threads
+
+- `DenoiserDocumentController` (`ARADocumentControllerSpecialisation`): one
+  per host document, shared by all plugin instances bound to it. Keeps one
+  `Source` record per audio source (captured properties, the host reader,
+  what needs doing, status, its `AudioSlot`s), owns **one analysis thread**,
+  stores and restores the archive. Declares no content types and no
+  playback transformations (`ARA_TRANSFORMATION_FLAGS
+  kARAPlaybackTransformationNoChanges`; `ARAPlaybackRegion` time-stretch is
+  not supported); `ARATestHost` reports "does not support content analysis /
+  time-stretching / content-based fades / storing audio file chunks".
+- `SourceAnalysis` (AraEngine.h, no JUCE): the input at the source's rate,
+  its 16 kHz version and the 16 kHz denoised result; makes the
+  `SourceAudio` to play at the source's rate or at another rate.
+- `SourceAudio`: what one source plays at one sample rate: the original
+  (shared, not copied, between versions) and the denoised samples (or none
+  yet). Immutable once published.
+- `AudioSlot`: where a source's `SourceAudio` (for one playback rate) is
+  published. **Hand-over without locks**: the analysis thread stores the new
+  pointer, then waits until no audio thread can still read the old one, then
+  frees it (a "left-right" scheme with two reader counters); an audio thread
+  registers on one counter, loads the pointer, renders, and leaves: an
+  atomic increment and decrement per region and 256-sample chunk, no
+  allocation, no lock, no wait.
+  The analysis thread is the only one that ever waits (for at most one
+  render block). The slot also has a `working` flag (analysis queued or
+  running for it), used by offline renders.
+- `DenoiserPlaybackRenderer` (`ARAPlaybackRenderer`): one per bound
+  instance. Its regions are turned into a `RenderPlan` (per region: timeline
+  range in samples, offset into the stored audio, the slot; the plan owns
+  the slots) on the host's document thread whenever the host ends an edit
+  or prepares the instance, and handed to the audio thread like the
+  real-time engine (one atomic pointer; the old plan is retired to one of 8
+  slots and freed on the control side). The audio thread reads only the plan
+  and the slots: no ARA model objects, no allocation, no locks, no file or
+  host reads (counted: 0 allocations through the whole VST3 call, see
+  Tests).
+- Who owns the stored audio: the slot owns the current `SourceAudio` (plus
+  the analysis's copy of the original, shared); plans own slots; the
+  document controller owns sources. Everything is freed off the audio thread.
+- Threads: the **host's document thread** (all ARA model calls, archives,
+  sample access; the editor's model choice; normally the message thread)
+  creates and destroys the host audio readers (ARA allows that only inside
+  those calls); the **analysis thread** reads, denoises and publishes; the
+  **audio threads** render. One mutex protects the controller's state; the
+  audio threads never take it, the analysis thread doesn't hold it while
+  working.
+
+### Where the model and the settings live
+
+**The model and the high-band choice are document settings.** One document
+controller serves every instance bound to the document, while the real-time
+model belongs to one instance; a per-instance model would make the same
+source sound different depending on which instance happens to render it. So:
+
+- **Load model...** / **Unload** in any bound instance's window set the
+  document's model, used for every source (the window says "Model (all
+  clips)"). The instance's own real-time model (its VST3 state) is not used
+  in ARA mode.
+- **Above 8 kHz** in that window is the document's choice too (it changes
+  the stored audio; switching it re-renders from the kept 16 kHz result, no
+  network run).
+- **Mix** and **Bypass** stay the instance's automatable parameters, applied
+  by its renderer as a plain crossfade (both signals are aligned):
+  `(1 − g) · original + g · denoised`, 20 ms ramps; mix 0 or bypass give the
+  original bit for bit. The host's bypass through `processBlockBypassed`
+  plays the original too.
+- **Saved in the ARA archive** (`doStoreObjectsToStream`, only when the host
+  asks for document data): the magic `ENMD`, a version (1), the model file's
+  absolute path (referenced, not embedded, as in VST3 mode) and the high-band
+  choice. **The audio is not stored**: on restore the model is loaded again
+  and every source is analysed again (the issue's recommendation; a cache is
+  a later improvement). An empty archive (from before this version) changes
+  nothing (a new document starts with no model); a newer version is refused (restore fails). A missing model
+  file leaves the original playing with "Model file not found: <path>", and
+  the path is kept, so saving again doesn't lose it. The archive ID stays
+  `org.enm156.denoiser.aradocumentarchive.1` (the earlier plugin stored
+  nothing).
+- For information only, an instance's VST3 state also carries an `ARA`
+  element with the document's model path, message and per-source states
+  (the headless test reads it).
+
+### The stored audio: memory, not a file
+
+Everything is kept **in memory**, as float32: the original and the denoised
+audio at the source's rate, plus the 16 kHz input and output (a third each
+at 48 kHz), about 2.7 × 4 bytes per sample and channel: **an hour of 48 kHz
+stereo takes about 3.7 GB**, a 5-minute stereo take 300 MB. Memory keeps the
+audio thread free of file reads (a temporary file would need its own
+read-ahead thread and real-time-safe buffering) and costs nothing to set up;
+a DAW project with several hour-long sources would want a file-backed store,
+which is not done. **Limit: 400 million samples per source** (all channels:
+69 minutes of 48 kHz stereo, 2.3 hours of 48 kHz mono); a longer source is not
+read and plays silence with a message, and an allocation failure does the
+same ("Out of memory"). There is no limit on the number of sources.
+
+### Sample rates
+
+- The source is analysed at its own rate (any rate from 16 to 384 kHz that
+  the resampler supports: 22.05, 24, 32, 44.1, 48, 88.2, 96, 176.4, 192,
+  352.8, 384 kHz).
+- **Playback at another rate than the source's** (a 44.1 kHz file in a
+  48 kHz project, which ARA leaves to the plugin): a second version at the
+  playback rate is made from the 16 kHz results (the denoised audio and the
+  original, both upsampled from 16 kHz), so it is the same denoised signal,
+  sample-aligned in time; the original there is band-limited to ~7.5 kHz and
+  the high band can't be passed through (dropped). A source whose own rate is
+  unsupported plays silence at other rates.
+- Timeline → source mapping: a region plays its modification range 1:1 from
+  its start on the timeline (`getSampleRange` at the render rate; source
+  sample = timeline sample − round(start in playback time · rate) +
+  round(start in modification time · rate)). Overlapping regions add up.
+  Stereo sources on a mono output play the mean of both channels; mono
+  sources on a stereo output play on both.
+
+### Rendering, offline renders, preview
+
+- Realtime: whatever is stored now plays (the original before the analysis
+  finishes, silence before the source has been read; reading is fast
+  compared with denoising).
+- **Offline (non-realtime) renders and bounces wait** for analysis that is
+  queued or running for the regions in the block (up to 300 s per block),
+  so a bounce right after loading a model contains the denoised audio. Not
+  for sources the host hasn't released yet or can't be read.
+- Editor renderer (preview): **not provided** beyond JUCE's default (which
+  adds nothing). The plugin has no ARA editor view of its own (no waveform,
+  no regions to audition in its window), so nothing would call for a
+  preview; the playback renderer covers what the host plays.
+- Speed (Release, one analysis thread per document, untrained models at
+  config.toml's sizes, `denoiser_ara_host_test ... bench <model> 60`): 60 s
+  of 48 kHz stereo in 5.2 s with the MLP (11.6× real time), 4.5 s with the
+  TCN (13.5×), 1.3 s with the recurrent SNN at 40 % spikes (46×). Sources are
+  analysed one after another; channels of one source too.
+
+### Tests (ctest)
+
+| test | what |
+|---|---|
+| `plugin_ara` | `vst/AraHostTest.cpp`: a **headless ARA host** made of JUCE's ARA hosting classes (`ARAHostDocumentController`, `ARAHostModel::*`) on the ARA SDK's host dispatch library. It loads the built `.vst3` with JUCE's VST3 hosting, creates ARA documents (musical context, region sequence, in-memory audio sources read through its audio access controller, modifications, playback regions), binds instances as playback renderers, gives the document its settings through `restoreObjectsFromArchive`, renders through the VST3 `process` call with a play head, and compares with the core. Covers: a whole source at 16 kHz equals `denoiseClip` (MLP, SNN, TCN, centred MLP; mono and stereo), at 44.1 and 48 kHz equals `denoiseClipAtRate` (MLP, TCN with the high band passed, centred TCN); a region moved to 0.5 s, trimmed (0.25–0.6 s of the source at 0.1 s, changed while prepared), split in two with the second part moved, a second use of the same source elsewhere (silence around and between); **realtime playback before the analysis finishes is the original bit for bit**, then the denoised audio, and the host receives started / updated / completed progress; a content update (sample access off, new samples, on, `updateAudioSourceContent`) gives the new source's denoised audio; a model change gives the new model's output; bypass and mix 0 give the original bit for bit, mix 0.5 the mean; `storeObjectsToArchive` → a new document → `restoreObjectsFromArchive` gives the same output and model path; a missing model file plays the original with "not found" and keeps the path; a 44.1 kHz source played at 48 kHz equals the 16 kHz result upsampled; a too-short source with a centred model, an empty source and an 8 kHz source (silence at 48 kHz, the original at 8 kHz) with their messages; on Linux, **0 heap allocations** over 400 realtime blocks of 1–512 samples with two regions, through JUCE's hosting, the VST3 wrapper and the renderer. Measured error: **0** in every comparison (the tolerance is 1e-5 of max(1, \|ref\|), as in `plugin_vst3`), Release with LTO and Debug, GCC 13. ~0.3 s in Release, ~1.5 s in Debug. |
+| `plugin_ara_engine` | `vst/AraEngineTest.cpp`, no JUCE: `SourceAnalysis` equals `denoiseClipAtRate` (MLP / SNN / TCN / two centred models at 16, 44.1, 48 kHz, both high-band choices; versions at another rate); no model, too short, empty, unsupported rates, >2 channels, cancellation; `renderPlan` mapping for moved / trimmed / split / overlapping regions, regions before the source's start or past its end, mono / stereo in and out, mix 0 / 0.25 / 1; 0 allocations in `renderPlan`; `AudioSlot` under load: one thread publishes new audio while two render from it for 1 s (~10 000 publications, ~600 000 blocks), no block mixes two publications. |
+| `offline_rate` (core) | `tests/test_offline_rate.cpp`: `modelRateLength`; 16 kHz copies and equals `denoiseClip` bit for bit; alignment at 22.05, 44.1, 48, 96 kHz: a band-limited signal to 16 kHz matches the same signal computed at 16 kHz to −114 dB, the round trip matches the input to −108 dB (one sample off: −6 to −18 dB); `denoiseClipAtRate` equals the parts composed by hand, PassThrough − Drop = input − round trip; short clips for centred models, unsupported rates, empty clips, cancellation. |
+| `cli` | also `denoise --resample` at 48 kHz (causal and centred, both high-band choices) equals `denoiseClipAtRate` (1e-5), and its error cases. |
+
+### What was run (and on what)
+
+All on Linux x86-64 (Ubuntu 24.04, GCC 13, 4 cores); CI runs the same
+ctest on Linux, Windows and macOS, which has not been seen for these tests
+yet (they are written to be portable: no GCC-only code, the allocation count
+only on Linux/glibc, the test hook through an environment variable set with
+`SetEnvironmentVariableW` on Windows).
+
+- **ctest, Release (GCC 13, link-time optimisation)**: all 22 tests pass
+  (`plugin_ara` ~0.6 s, `plugin_ara_engine` ~1.1 s); `plugin_ara` and
+  `plugin_ara_engine` also passed 30 times in a row.
+- **ctest, Clang 18 Debug**: all 22 pass; no compiler warning anywhere in
+  the build.
+- **ctest, Debug** (JUCE assertions and the ARA library's API validation,
+  `ARA_VALIDATE_API_CALLS`, on in the plugin and in the host side): all pass,
+  no assertion. That validation found the missing information URL.
+- **AddressSanitizer + UBSan** (Debug, JUCE, the plugin and the tests all
+  instrumented): all 22 tests pass with no report, and `plugin_ara` 10 more
+  times (this found two races in the test itself, now fixed, and the case of
+  a renderer prepared while the analysis was busy staying silent instead of
+  playing the original, now fixed in the plugin).
+- **ThreadSanitizer** (RelWithDebInfo, JUCE, the plugin and the tests all
+  instrumented): `plugin_ara` 4 times (including the test that renders on a
+  separate audio thread, ~5 000-6 000 blocks while the model, the high band
+  and a source's samples change 8 times) and `plugin_ara_engine` with a 10 s
+  `AudioSlot` stress (68 707 publications during 500 092 blocks on two
+  rendering threads): **no reports**.
+- **Steinberg's VST3 validator** 3.8.0: **47 / 47 passed**, and
+  **pluginval 1.0.4 at strictness 10, including its GUI tests under Xvfb:
+  SUCCESS**, both on the Release build without a model and on a build with
+  `-DDENOISER_DEFAULT_MODEL=<config.toml-sized TCN>`. These tools don't
+  bind ARA: they check the real-time side and that the ARA additions didn't
+  break it.
+- **The ARA SDK's `ARATestHost`** (ARA_Examples of the pinned SDK 2.3.0,
+  built in Debug against the VST3 SDK 3.8.0 with its ARA validation on;
+  outside ctest, it needs the VST3 SDK and a separate build; GCC 13 needed
+  `-include limits` for one of its headers): all its test cases
+  (property updates, content updates, content reading, modification
+  cloning, archiving, split archives, drag and drop, playback rendering,
+  editor view, processing algorithms, audio file chunk saving and loading)
+  ran against the Debug and the Release plugin with **no assertion and exit
+  status 0**. It reports the plugin's factory correctly (no content analysis,
+  no time-stretching, no fades, no audio file chunks). It doesn't check
+  output values (it prints the first rendered samples; its render happens
+  before the analysis, so they are the source's first samples or silence),
+  and it gives the plugin no model, so its value is the API conformance of
+  the document controller under a second, independent host.
+  Run as `ARATestHost -vst3 "<...>/ENM156 Denoiser.vst3/Contents/x86_64-linux/ENM156 Denoiser.so"`.
+- Not run: anything on Windows or macOS (CI will run the ctest part), any
+  DAW, the ARA-mode window (it compiles and is shared with the tested VST3
+  window, but no test opens it bound to ARA).
+
+### The issue's "Done when", one by one
+
+| "Done when" item | status |
+|---|---|
+| a clip in an ARA host plays back denoised, in sync, including when the region is moved, trimmed or split | **Verified through the headless ARA host** (`plugin_ara`: whole sources at 16 / 44.1 / 48 kHz, a moved, a trimmed, a split region, two uses of one source; sample-aligned, error 0). **Not verified in a DAW.** |
+| the samples equal the CLI output for the same source and model (after resampling) | **Verified headlessly, in two steps**: the plugin's output equals the core's `denoiseClip` (16 kHz) / `denoiseClipAtRate` (44.1, 48 kHz) with error 0 (`plugin_ara`), and `denoise --resample` (16 kHz: plain `denoise`) equals `denoiseClipAtRate` (`cli`, 1e-5). **Not verified with a DAW's render.** |
+| save, close and reopen a project: it comes back denoised with the same model | **Verified headlessly** as ARA archive store → new document and instance → restore: same output (error 0) and model path; a missing model file plays the original with a message. **Not verified in a DAW** (a DAW's own project saving, and when it restores, is not exercised). |
+| editing the source in the host triggers a new analysis | **Verified headlessly**: sample access off, new samples, on, `updateAudioSourceContent` → the new samples' denoised output (error 0); also under concurrent rendering. **Not verified in a DAW** (which edits send which notifications is host-specific). |
+| a non-causal checkpoint works in ARA mode and is refused, with a message, in real-time mode | **Verified headlessly** with the golden centred models (`offline_mlp_mask_centred`, `offline_tcn_complex_centred`): in ARA mode equal to `denoiseClip` / `denoiseClipAtRate` (error 0, `plugin_ara`); in real-time mode audio passes through with "... centred ... can't run in real time ... It can be used in ARA mode." (`plugin_vst3`). There is no exported trained non-causal checkpoint here. **Not verified in a DAW.** |
+
+### Limitations and what is not supported
+
+- Time-stretching, content-based fades, content (notes, tempo, chords) for
+  the host, audio file chunks, processing algorithms: none (declared so).
+  A region whose playback duration differs from its modification duration
+  (a host that stretches anyway) plays unstretched from its start and is
+  cut at its end.
+- Head and tail time are 0: denoising doesn't ring past the region.
+- The model is one per document; per-clip models would need a per-
+  modification setting (the archive format has a version for it).
+- Two channels per source at most.
+- Memory as above; no on-disk cache, so reopening a project analyses every
+  source again (11–46× real time for config.toml-sized models on one core).
+- The analysis uses one thread per document.
+- Logic (ARA through Audio Units) is out of scope (no AU target).
+- The host's document thread is assumed to be the message thread when the
+  model is chosen in the window (true for the hosts named in the issue): the
+  host is told about the content change from that thread.
+- JUCE 9.0.5 / ARA SDK 2.3 quirks found on the way (none needed a change
+  outside this folder): ARA requires a non-empty information URL in the
+  factory (the plugin now has `COMPANY_WEBSITE`); JUCE's
+  `ARAHostModel::PlaybackRegionRegistry` destructor crashes (erases from the
+  map it iterates) if regions are still registered, so the test removes them
+  first; JUCE's VST3 hosting unloads the module with its last instance while
+  a document's ARA objects still need it, so the test keeps one unbound
+  instance alive, as a DAW keeps modules loaded; the ARA library drops an
+  analysis that starts and completes between two `notifyModelUpdates` calls
+  without reporting it (by design), so a host sees progress only for
+  analyses that outlast its polling interval.
+
+### Checklist for the owner: ARA in a DAW (not done: no DAW here)
+
+Nothing in this section has been run in a DAW. Use a Release build installed
+as in "Not verified: running in a DAW" above, an exported `model.bin`, and a
+speech recording with noise (best: a 16 kHz mono WAV and a 48 kHz stereo
+WAV). Try **REAPER** (6.x or 7.x) and **one of Studio One (5.5+) / Cubase or
+Nuendo (Pro / Artist 12+)**. Menu names below are from those hosts' manuals
+and may differ slightly by version.
+
+1. **Insert as an ARA extension.**
+   - REAPER: select the item, open its take FX chain (Item → Take → Take FX
+     chain, or Shift+E) and add "VST3: ENM156 Denoiser (ENM156)". REAPER
+     binds ARA plug-ins in take FX when ARA is enabled (Preferences →
+     Plug-ins → ARA, and in the FX window's menu "Enable ARA for this
+     plug-in"). The plug-in's window shows "Model (all clips)" and a list of
+     sources: that is ARA mode. If it shows "Latency: ..." instead, it is
+     running as a plain real-time effect.
+   - Studio One: right-click the audio event → the plug-in's name in the
+     event menu (ARA extensions are listed there), or drag the plug-in onto
+     the event.
+   - Cubase / Nuendo: select the event → Audio → Extensions → ENM156
+     Denoiser.
+2. **Load a model**: in the plug-in's window, **Load model...** → your
+   `model.bin`. The description line appears; the source list shows each
+   clip "denoising NN %", then "denoised". The host may show its own
+   analysis progress bar. Without a model every clip says "original" and
+   sounds unchanged.
+3. **Listen**: noise reduced, nothing above ~7.5 kHz with "Drop"; switch
+   "Above 8 kHz" to "Pass through": the top end comes back for every clip
+   (quickly: no network run). Mix and Bypass act per plug-in instance, with
+   no click and no timing shift.
+4. **Sync**: put an unprocessed copy of the clip on another track, invert
+   its polarity, set Mix to 0 (or bypass): the two must null completely
+   (the original is copied bit for bit). With Mix 100 % the difference is
+   the removed noise, with no comb filtering or echo (no delay). Move the
+   clip, trim its start and end, split it and move one part, duplicate it:
+   each part stays in sync (null with Mix 0, and denoised content stays
+   under the same words).
+5. **Against the command-line tool**: export (render / bounce / "glue") the
+   processed clip with Mix 100 % at the project rate to a 32-bit float WAV,
+   starting exactly at the clip start. Run
+   `denoise --resample --float model.bin source.wav cli.wav` on the same
+   source file (`--high-band=pass` if you chose Pass through; for a 16 kHz
+   source plain `denoise model.bin source.wav cli.wav` gives the same
+   samples). Import `cli.wav` at the clip's position, invert, sum: the
+   residue should be below −100 dB (the headless test measures 0). A trimmed
+   region equals the corresponding part of `cli.wav`. Do this with the
+   project at the file's own rate: at another project rate the plug-in plays
+   the 16 kHz result upsampled to the project rate (see "Sample rates"),
+   which the tool doesn't produce directly.
+6. **Bounce right after loading a model** (offline render): the bounce must
+   contain the denoised audio (the renderer waits for the analysis), not the
+   original.
+7. **Edit the source**: a destructive edit (REAPER: e.g. apply a fade or
+   gain as new take / "Apply track FX to items" on the source, Studio One /
+   Cubase: a direct offline process on the event): the clip shows
+   "denoising" again and then plays the denoised new samples.
+8. **Save, close, reopen** the project: it comes back denoised with the same
+   model (the source list shows the analysis running again on open; the
+   audio is not stored in the project). Rename the model file and reopen:
+   the clips play the original and the window says "Model file not found:
+   <path>"; put the file back and choose it again.
+9. **A non-causal model** (exported from a checkpoint with
+   `stft.causal = false`; its description ends in "centred frames: offline
+   only"): load it
+   in ARA mode, it denoises (listen: no pre-echo, it uses half a window of
+   look-ahead); load the same file in a plug-in instance used as a normal
+   real-time track insert: audio passes through and the window says the
+   model "can't run in real time ... It can be used in ARA mode."
+10. Also check: a 44.1 kHz file in a 48 kHz project (plays denoised, in
+    sync, dull above ~7.5 kHz even with Pass through), a mono file on a
+    stereo track, a very short clip with a non-causal model ("Too short",
+    original plays), two instances on different tracks sharing the model,
+    and that the project's CPU load during playback is negligible (all work
+    happens in the analysis).
 
 ## Layout
 
@@ -412,11 +786,11 @@ plugin/
   cmake/Dependencies.cmake   KISS FFT always; JUCE + ARA SDK with DENOISER_BUILD_PLUGIN
   core/                 denoiser_core (alias denoiser::core): static library, no JUCE
     include/denoiser/   public headers: fft.h (RealFft), model_file.h, features.h, stream.h,
-                        offline.h, host_rate.h, resample.h, networks.h (MLP, SNN),
+                        offline.h, offline_rate.h, host_rate.h, resample.h, networks.h (MLP, SNN),
                         denoiser.h (Model, ChannelDenoiser)
     src/                sources
   cli/                  denoiser_cli, built as `denoise`: links the core
-    main.cpp            argument handling, offline and --stream modes
+    main.cpp            argument handling, offline, --resample and --stream modes
     wav.h / wav.cpp     WAV reader/writer
   tests/                core tests, one executable each, run by ctest
     check.h             CHECK / CHECK_NEAR, no test framework
@@ -426,8 +800,11 @@ plugin/
     PluginProcessor.*   the processor: parameters, state, model loading, engine hand-over
     RealtimeEngine.*    one prepared processing state (model, denoisers, adapter, mix); no JUCE
     PluginEditor.*      the plugin's window
-    DocumentController.cpp   the ARA entry point (createARAFactory), empty for now
+    DocumentController.*     ARA: document controller (analysis thread, archive) and playback renderer
+    AraEngine.*         ARA below the ARA interface: analysis, stored audio (AudioSlot), region rendering; no JUCE
     HostTest.cpp        headless VST3 host: the plugin_vst3 test
+    AraHostTest.cpp     headless ARA host: the plugin_ara test (and an analysis benchmark)
+    AraEngineTest.cpp   the ARA engine on its own: the plugin_ara_engine test
     ProcessorTest.cpp   the processor without a host: plugin_processor_* tests, CPU benchmark
 ```
 
@@ -627,6 +1004,9 @@ auto net = model->makeNetwork();
 std::vector<float> y = denoiser::denoiseClip(model->info(), *net, x, n);   // same length, no delay
 // ... or the plugin's own path at the host rate, latency removed:
 denoiser::processClipAligned(adapter, channel, in, out, n);
+// ... or offline at any supported rate, aligned (ARA mode, denoise --resample;
+// #include "denoiser/offline_rate.h"; also clipToModelRate / clipFromModelRate):
+std::vector<float> z = denoiser::denoiseClipAtRate(model->info(), *net, rate, x, n, denoiser::HighBand::Drop);
 ```
 
 - **Threads.** A `Model` is immutable once loaded: share one
@@ -652,12 +1032,16 @@ denoiser::processClipAligned(adapter, channel, in, out, n);
 ### The command-line tool
 
 ```
-denoise [--stream] [--high-band=drop|pass] [--format=same|pcm16|pcm24|pcm32|float32|float64] [--float] [-q]
+denoise [--stream | --resample] [--high-band=drop|pass] [--format=same|pcm16|pcm24|pcm32|float32|float64] [--float] [-q]
         model.bin in.wav out.wav
 ```
 
 - Default: offline, `denoiseClip` per channel (any number of channels); the
   file must be at the model's rate (16 kHz). Centred models work here.
+- `--resample`: offline at the file's own rate (16 kHz or 22.05–384 kHz),
+  exactly as the plugin's ARA mode does it (`denoiseClipAtRate`: each channel
+  to 16 kHz, `denoiseClip`, back, aligned; `--high-band` as there). Centred
+  models work here too. Use it to compare an ARA render with the tool.
 - `--stream`: each channel as the plugin runs it (`ChannelDenoiser` behind
   `HostRateAdapter` at the file's rate: 16 kHz or 22.05–384 kHz), latency
   removed with `processClipAligned`. Centred models are refused with a message.
@@ -677,7 +1061,8 @@ denoise [--stream] [--high-band=drop|pass] [--format=same|pcm16|pcm24|pcm32|floa
 | `networks` | every golden MLP / SNN case: `pred` from the golden `x` (1e-5); SNN spikes vs `snn.spikes*` exactly, spike rates vs the header, both kernels with identical spikes; `reset()` bit-exact; missing tensors give clear errors; the factory builds a TCN |
 | `denoiser_golden` | from the golden `input`: `denoiseClip` vs `offline` (causal and centred), `ChannelDenoiser` vs `streamed` (1e-5, pre-roll 1e-4; muted pre-roll exactly 0); the 16 kHz host path (below) |
 | `networks_alloc` | no heap allocation in the networks, `ChannelDenoiser`, and the adapter at 16 and 48 kHz stereo; `reset()` reproduces a fresh run bit for bit |
-| `cli` | runs the built `denoise` on float and 16-bit WAVs made from the golden inputs (offline and `--stream`, stereo) and checks the files; 14 runs with their expected exit status; `--stream` at 48 kHz; the WAV code on its own. `DENOISE_LAUNCHER` runs the tool through e.g. `qemu-aarch64` |
+| `cli` | runs the built `denoise` on float and 16-bit WAVs made from the golden inputs (offline and `--stream`, stereo) and checks the files; 16 runs with their expected exit status; `--stream` at 48 kHz; `--resample` at 48 kHz equals `denoiseClipAtRate` (causal and centred, both high-band choices); the WAV code on its own. `DENOISE_LAUNCHER` runs the tool through e.g. `qemu-aarch64` |
+| `offline_rate` | whole clips at other rates (`offline_rate.h`, for ARA): see "ARA: whole clips", "Tests" |
 
 Measured (Linux x86-64, GCC 13 Release; error = max |c++ − golden| / max(1, max |golden|)):
 

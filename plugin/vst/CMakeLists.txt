@@ -3,6 +3,8 @@
 juce_add_plugin(DenoiserPlugin
     PRODUCT_NAME "ENM156 Denoiser"
     COMPANY_NAME "ENM156"
+    # ARA requires an information URL in its factory
+    COMPANY_WEBSITE "https://github.com/supersonic-lumina/ENM156"
     BUNDLE_ID org.enm156.denoiser
     PLUGIN_MANUFACTURER_CODE Enms   # four characters, at least one upper-case
     PLUGIN_CODE Dnz1                # four characters, exactly one upper-case
@@ -20,13 +22,18 @@ juce_add_plugin(DenoiserPlugin
     # BUNDLE_ID: "org.enm156.denoiser.arafactory.<version>" and
     # "org.enm156.denoiser.aradocumentarchive.1" (bump the latter when the
     # stored document format changes)
-    IS_ARA_EFFECT ${DENOISER_ENABLE_ARA})
+    IS_ARA_EFFECT ${DENOISER_ENABLE_ARA}
+    # The plugin replaces samples one for one: no time-stretching or
+    # content-based fades, and no content (notes, tempo, ...) for the host to
+    # read (ARA_ANALYSIS_TYPES is left at JUCE's default, none)
+    ARA_TRANSFORMATION_FLAGS kARAPlaybackTransformationNoChanges)
 
 target_sources(DenoiserPlugin
     PRIVATE
         PluginProcessor.cpp
         PluginEditor.cpp
         RealtimeEngine.cpp
+        AraEngine.cpp
         DocumentController.cpp)
 
 target_compile_definitions(DenoiserPlugin
@@ -82,6 +89,35 @@ if(DENOISER_BUILD_TESTS)
         COMMAND denoiser_plugin_host_test "${denoiser_vst3_bundle}" "${PROJECT_SOURCE_DIR}/tests/golden")
 endif()
 
+# A headless ARA host (JUCE's ARA hosting classes + the ARA SDK's host
+# dispatch library) that drives the built VST3 through the ARA interface
+# (ctest: plugin_ara)
+if(DENOISER_BUILD_TESTS AND DENOISER_ENABLE_ARA)
+    juce_add_console_app(denoiser_ara_host_test
+        PRODUCT_NAME "denoiser_ara_host_test"
+        NEEDS_WEB_BROWSER FALSE
+        NEEDS_CURL FALSE)
+    target_sources(denoiser_ara_host_test PRIVATE AraHostTest.cpp)
+    target_compile_definitions(denoiser_ara_host_test
+        PRIVATE
+            JUCE_PLUGINHOST_VST3=1
+            JUCE_PLUGINHOST_ARA=1
+            JUCE_WEB_BROWSER=0
+            JUCE_USE_CURL=0)
+    target_link_libraries(denoiser_ara_host_test
+        PRIVATE
+            denoiser::core
+            juce::juce_audio_processors_headless
+            juce::juce_events
+        PUBLIC
+            juce::juce_recommended_config_flags
+            juce::juce_recommended_warning_flags)
+    add_dependencies(denoiser_ara_host_test DenoiserPlugin_VST3)
+    add_test(NAME plugin_ara
+        COMMAND denoiser_ara_host_test "${denoiser_vst3_bundle}" "${PROJECT_SOURCE_DIR}/tests/golden"
+                "${CMAKE_CURRENT_BINARY_DIR}/ara_work")
+endif()
+
 # The processor class tested directly, without a plugin host: its sources
 # compiled into a console program with ARA off (ctest: plugin_processor_*).
 # Allocation counting replaces operator new / malloc; turn it off for
@@ -117,4 +153,21 @@ if(DENOISER_BUILD_TESTS)
     add_test(NAME plugin_processor_alloc COMMAND denoiser_processor_test alloc "${golden_dir}")
     add_test(NAME plugin_processor_core COMMAND denoiser_processor_test core "${golden_dir}")
     add_test(NAME plugin_processor_stress COMMAND denoiser_processor_test stress "${golden_dir}" 2)
+endif()
+
+# The ARA engine below the ARA interface (analysis, stored audio, region
+# rendering): plain C++, no JUCE (ctest: plugin_ara_engine)
+if(DENOISER_BUILD_TESTS)
+    add_executable(denoiser_ara_engine_test AraEngineTest.cpp AraEngine.cpp)
+    target_link_libraries(denoiser_ara_engine_test PRIVATE denoiser::core)
+    find_package(Threads REQUIRED)
+    target_link_libraries(denoiser_ara_engine_test PRIVATE Threads::Threads)
+    target_compile_definitions(denoiser_ara_engine_test
+        PRIVATE DENOISER_COUNT_ALLOCATIONS=$<BOOL:${DENOISER_PROCESSOR_TEST_COUNT_ALLOCATIONS}>)
+    if(MSVC)
+        target_compile_options(denoiser_ara_engine_test PRIVATE /W4)
+    else()
+        target_compile_options(denoiser_ara_engine_test PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Wconversion)
+    endif()
+    add_test(NAME plugin_ara_engine COMMAND denoiser_ara_engine_test "${PROJECT_SOURCE_DIR}/tests/golden" 1)
 endif()

@@ -4,7 +4,7 @@
 set(DENOISER_TESTS
     core
     fft
-    resample host_rate
+    resample host_rate offline_rate
     model_file stft_golden stft_alloc
     networks denoiser_golden networks_alloc)
 

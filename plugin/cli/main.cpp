@@ -6,6 +6,9 @@
 // Default (offline): the file must be at the model's sample rate; every
 // channel is denoised on its own with denoiseClip (pipeline.enhance: same
 // length, no delay; works for centred models too).
+// --resample: offline at the file's own sample rate, the way the plugin's
+// ARA mode does it: each channel resampled to 16 kHz, denoised as a whole
+// clip, resampled back, aligned (denoiseClipAtRate).
 // --stream: every channel runs the way the real-time plugin runs it, at the
 // file's own sample rate (any rate HostRateAdapter supports): a
 // ChannelDenoiser behind a HostRateAdapter, with the latency removed
@@ -19,6 +22,7 @@
 #include "denoiser/denoiser.h"
 #include "denoiser/host_rate.h"
 #include "denoiser/offline.h"
+#include "denoiser/offline_rate.h"
 #include "denoiser/resample.h"
 
 #include <chrono>
@@ -45,9 +49,12 @@ const char* const kUsage =
     "                    file's own sample rate (16 kHz, or 22.05 to 384 kHz with\n"
     "                    resampling), latency removed. Real-time models only.\n"
     "                    Default: offline, whole clip, at the model's rate only.\n"
-    "  --high-band=MODE  with --stream above 16 kHz: 'drop' (default, as the plugin)\n"
-    "                    outputs only the denoised band below ~7.5 kHz; 'pass' adds\n"
-    "                    back the band above 8 kHz, untouched\n"
+    "  --resample        offline, whole clip, at the file's own sample rate, as the\n"
+    "                    plugin's ARA mode does it: resampled to the model's rate,\n"
+    "                    denoised, resampled back, aligned. Any model.\n"
+    "  --high-band=MODE  with --stream or --resample above 16 kHz: 'drop' (default,\n"
+    "                    as the plugin) outputs only the denoised band below\n"
+    "                    ~7.5 kHz; 'pass' adds back the band above 8 kHz, untouched\n"
     "  --format=FMT      out.wav sample format: same (default: as in.wav), pcm16,\n"
     "                    pcm24, pcm32, float32, float64\n"
     "  --float           the same as --format=float32\n"
@@ -59,6 +66,7 @@ struct UsageError : std::runtime_error {
 
 struct Options {
     bool stream = false;
+    bool resample = false;
     bool quiet = false;
     denoiser::HighBand highBand = denoiser::HighBand::Drop;
     bool sameFormat = true;
@@ -79,6 +87,8 @@ Options parse(const std::vector<std::filesystem::path>& args) {
             optionsDone = true;
         } else if (a == "--stream") {
             o.stream = true;
+        } else if (a == "--resample") {
+            o.resample = true;
         } else if (a == "-q" || a == "--quiet") {
             o.quiet = true;
         } else if (a == "--float") {
@@ -102,6 +112,8 @@ Options parse(const std::vector<std::filesystem::path>& args) {
             throw UsageError("unknown option " + a);
         }
     }
+    if (o.stream && o.resample)
+        throw UsageError("--stream and --resample exclude each other");
     if (o.files.size() != 3)
         throw UsageError("expected 3 file names (model.bin in.wav out.wav), got " + std::to_string(o.files.size()));
     return o;
@@ -144,11 +156,32 @@ int run(const Options& o) {
     out.sampleRate = in.sampleRate;
     out.channels.resize(in.channels.size());
     const auto start = Clock::now();
-    if (!o.stream) {
+    if (o.resample) {
+        if (!denoiser::isSupportedHostRate(in.sampleRate))
+            throw std::runtime_error(inName + ": sample rate " + std::to_string(in.sampleRate) +
+                                     " Hz is not supported for --resample (supported: " + supportedRates() + " Hz)");
+        const std::unique_ptr<denoiser::FrameNetwork> net = model->makeNetwork();
+        for (int c = 0; c < channels; ++c) {
+            const auto& x = in.channels[std::size_t(c)];
+            try {
+                out.channels[std::size_t(c)] =
+                    denoiser::denoiseClipAtRate(info, *net, in.sampleRate, x.data(), x.size(), o.highBand);
+            } catch (const std::invalid_argument& e) {
+                throw std::runtime_error(inName + ": " + e.what());
+            }
+        }
+        if (!o.quiet)
+            std::fprintf(stderr, "mode: offline at %d Hz (whole clip through %d Hz, as the plugin's ARA mode%s)\n",
+                         in.sampleRate, info.sampleRate,
+                         in.sampleRate == info.sampleRate         ? ""
+                         : o.highBand == denoiser::HighBand::Drop ? ", band above 8 kHz dropped"
+                                                                  : ", band above 8 kHz passed through");
+    } else if (!o.stream) {
         if (in.sampleRate != info.sampleRate)
             throw std::runtime_error(inName + " is " + std::to_string(in.sampleRate) + " Hz; the model runs at " +
                                      std::to_string(info.sampleRate) +
-                                     " Hz. Resample it first, or use --stream (resamples like the plugin).");
+                                     " Hz. Resample it first, or use --resample (offline, as the plugin's ARA mode) "
+                                     "or --stream (as the real-time plugin).");
         const std::unique_ptr<denoiser::FrameNetwork> net = model->makeNetwork();
         for (int c = 0; c < channels; ++c) {
             const auto& x = in.channels[std::size_t(c)];
