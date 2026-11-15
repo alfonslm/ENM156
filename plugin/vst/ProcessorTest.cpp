@@ -372,10 +372,17 @@ void bench(const std::vector<juce::String>& files, double seconds) {
     for (const juce::String& file : files) {
         for (bool highPass : {false, true}) {
             auto p = makeProcessor(channels);
-            if (file != "none")
-                p->loadModelFile(juce::File::getCurrentWorkingDirectory().getChildFile(file));
             setParam(*p, DenoiserProcessor::kHighBandId, highPass ? 1.0f : 0.0f);
             p->prepareToPlay(rate, block);
+            if (file != "none") {
+                // What a model choice costs the thread that makes it (file, parse, build)
+                const auto t0 = std::chrono::steady_clock::now();
+                p->loadModelFile(juce::File::getCurrentWorkingDirectory().getChildFile(file));
+                const double ms = 1000.0 * std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                if (!highPass)
+                    std::printf("%s: loading took %.1f ms\n", file.toRawUTF8(), ms);
+                p->prepareToPlay(rate, block);
+            }
             double best = 1e30, worstBlock = 0.0;
             for (int run = 0; run < 3; ++run) {
                 p->reset();
