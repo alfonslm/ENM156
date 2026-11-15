@@ -4,7 +4,7 @@
 // renderers, and checks the plugin's ARA side against the core library.
 // Run by ctest as `plugin_ara`.
 //
-//   denoiser_ara_host_test "<path to>/ENM156 Denoiser.vst3" <golden dir> <work dir>
+//   denoiser_ara_host_test "<path to>/ENM156 Denoiser.vst3" <golden dir>
 //
 // The host side plays the role of a DAW: audio sources are in-memory clips
 // (golden inputs and synthetic ones), read by the plugin through the host's
@@ -29,12 +29,14 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -62,12 +64,6 @@
 #endif
 #endif
 
-#if defined(_WIN32)
-// From kernel32 (declared here rather than including <windows.h>, whose
-// macros clash with names in JUCE and the ARA SDK)
-extern "C" __declspec(dllimport) int __stdcall SetEnvironmentVariableW(const wchar_t* name, const wchar_t* value);
-#endif
-
 namespace {
 
 using Audio = std::vector<std::vector<float>>;  // planar
@@ -75,7 +71,6 @@ namespace HM = juce::ARAHostModel;
 
 int failures = 0;
 juce::String goldenDir;
-juce::File workDir;
 const ARA::ARAFactory* araFactory = nullptr;
 
 void fail(const juce::String& message) {
@@ -195,6 +190,7 @@ public:
     bool readAudioSamples(ARA::ARAAudioReaderHostRef readerRef, ARA::ARASamplePosition position,
                           ARA::ARASampleCount count, void* const buffers[]) noexcept override {
         const TestSource& s = *ReaderConverter::fromHostRef(readerRef)->source;
+        waitAtGate();
         ++reads;
         for (size_t c = 0; c < s.data.size(); ++c) {
             auto* out = static_cast<float*>(buffers[c]);
@@ -211,6 +207,52 @@ public:
     }
     std::atomic<int> readersAlive{0};
     std::atomic<long> reads{0};
+
+    // The host's control over its reads (a DAW's reads can be slow, e.g. from
+    // disk or the network): while the gate is closed, every read waits in the
+    // host until the host lets it through. Open by default.
+    void closeGate() {
+        const std::lock_guard<std::mutex> lock(gateMutex_);
+        gateClosed_ = true;
+    }
+    void openGate() {
+        {
+            const std::lock_guard<std::mutex> lock(gateMutex_);
+            gateClosed_ = false;
+        }
+        gate_.notify_all();
+    }
+    // Lets one waiting (or the next) read through, the gate staying closed
+    void letOneThrough() {
+        {
+            const std::lock_guard<std::mutex> lock(gateMutex_);
+            ++passes_;
+        }
+        gate_.notify_all();
+    }
+    // Waits until `n` reads in all have come to the closed gate (false after 20 s)
+    bool waitForArrivals(int n) {
+        std::unique_lock<std::mutex> lock(gateMutex_);
+        return gate_.wait_for(lock, std::chrono::seconds(20), [&] { return arrivals_ >= n; });
+    }
+
+private:
+    void waitAtGate() {
+        std::unique_lock<std::mutex> lock(gateMutex_);
+        if (!gateClosed_)
+            return;
+        ++arrivals_;
+        gate_.notify_all();
+        gate_.wait(lock, [&] { return !gateClosed_ || passes_ > 0; });
+        if (gateClosed_)
+            --passes_;
+    }
+
+    std::mutex gateMutex_;
+    std::condition_variable gate_;
+    bool gateClosed_ = false;
+    int arrivals_ = 0;
+    int passes_ = 0;
 };
 
 class Archiving final : public ARA::Host::ArchivingControllerInterface {
@@ -654,45 +696,85 @@ void testRegions(Host& host) {
     check(isSilent(out[0], 19200, 9600) && isSilent(out[1], 57600, 14400), "split: gap is silent");
 }
 
-// The original plays until the denoised audio is ready (realtime), then the denoised audio
+// The original plays until the denoised audio is ready (realtime), then the
+// denoised audio, in the same running renderer. Held by the host alone, as a
+// DAW whose reads are slow could: there is no test hook in the plugin.
+//
+// The plugin publishes a source's original as soon as it has read it, then
+// denoises. To stop it in between, the host keeps its first read waiting,
+// tells the plugin meanwhile that the source's samples changed (the same
+// samples here), and lets that read finish: the plugin publishes what it
+// read, stops the now out-of-date denoising at its first frame and reads
+// again, and the host keeps that second read waiting. The source has then
+// been read and its analysis is not finished, for as long as the host likes.
 void testBeforeAnalysis(Host& host) {
     std::printf("playback before the analysis finishes gives the original\n");
-    const juce::File hold = workDir.getChildFile("hold");
     const juce::String path = golden("tcn_magnitude_default.model.bin");
     auto model = loadModel(path);
     auto doc = host.createDocument(2);
     if (!doc || !model)
         return;
-    const Audio data = noise(2, 24000, 31);
-    check(hold.create().wasOk(), "cannot create " + hold.getFullPathName());  // the analysis waits before denoising
+    const Audio data = noise(2, 24000, 31);  // one host read (the plugin asks for 65536 samples at a time)
     auto& src = doc->addSource(data, 48000, "source-h");
     doc->addRegion(src, 0.0, 0.5, 0.0);
+    AudioAccess& access = *doc->access;
+    // The plugin's analysis thread must not be left waiting at the gate when the document goes
+    struct OpenGateAtEnd {
+        AudioAccess& access;
+        ~OpenGateAtEnd() { access.openGate(); }
+    } openGateAtEnd{access};
+
+    // Prepared for realtime playback before the analysis starts: what it plays
+    // is replaced while it stays prepared
+    doc->plugin->releaseResources();
+    doc->plugin->setNonRealtime(false);
+    doc->plugin->setRateAndBufferSizeDetails(48000, 4096);
+    doc->plugin->prepareToPlay(48000, 4096);
+
+    access.closeGate();
     check(doc->restore(settingsArchive(path)), "restore");
-    // Wait until the source has been read and the analysis waits at the hold
-    // (the window then says "denoising 0 %"), then render in realtime
-    for (int attempt = 0; attempt < 2000 && !sourceStatus(*doc->plugin).contains("denoising"); ++attempt)
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    Audio out = doc->render(48000, 0, 24000, true);
+    if (!access.waitForArrivals(1)) {
+        fail("the plugin did not read the source");
+        return;
+    }
+    Audio out = doc->renderPrepared(48000, 0, 24000);
+    check(isSilent(out[0], 0, 24000) && isSilent(out[1], 0, 24000), "before the source was read: not silence");
+
+    {
+        const juce::ARAEditGuard guard(doc->dc());
+        doc->dc().updateAudioSourceContent(src.source->getPluginRef(), nullptr,
+                                           ARA::ContentUpdateScopes::samplesAreAffected());
+    }
+    access.letOneThrough();
+    if (!access.waitForArrivals(2)) {
+        fail("the plugin did not read the source again after the content update");
+        return;
+    }
+    out = doc->renderPrepared(48000, 0, 24000);
     check(sameSamples(out[0], 0, data[0], 0, 24000) && sameSamples(out[1], 0, data[1], 0, 24000),
           "before the analysis finished: not the original audio, bit for bit");
-    check(sourceStatus(*doc->plugin).contains("denoising"), "status while held: " + sourceStatus(*doc->plugin));
+    check(sourceStatus(*doc->plugin).contains("source-h: reading"),
+          "status while the read waits: " + sourceStatus(*doc->plugin));
     // The host hears about it (a quick analysis that starts and ends between
     // two notifyModelUpdates calls is not reported at all: the ARA library
     // drops a start followed by its completion)
     Progress& p = doc->updates->progress[src.data.get()];
     pollUpdates(*doc, [&] { return p.started > 0; });
     check(p.started >= 1, "the host was not told that the analysis started");
-    hold.deleteFile();
-    pollUpdates(*doc, [&] { return p.completed > 0; });
+    const int completedBefore = p.completed;  // the stopped job's, if it was reported
+
+    access.openGate();
+    pollUpdates(*doc, [&] { return sourceStatus(*doc->plugin).contains("source-h: denoised"); });
+    pollUpdates(*doc, [&] { return p.completed > completedBefore; });
     std::printf("  progress notifications: %d started, %d updates (last %.2f), %d completed\n", p.started,
                 p.updated, double(p.last), p.completed);
-    check(p.completed >= 1, "the host was not told that the analysis completed");
-    out = doc->render(48000, 0, 24000, false);  // offline: waits for the analysis
+    check(p.completed > completedBefore, "the host was not told that the analysis completed");
+    out = doc->renderPrepared(48000, 0, 24000);  // still realtime, not prepared again
     Audio ref;
     for (const auto& ch : data)
         ref.push_back(reference(*model, 48000, ch));
     const double err = compareChannels(out, ref, 0, 0, 24000);
-    std::printf("  original while held (exact); denoised after: %.2e\n", err);
+    std::printf("  original while the analysis waits (exact); denoised after, same renderer: %.2e\n", err);
     check(err <= kTolerance, "after the analysis: error " + juce::String(err));
 }
 
@@ -990,23 +1072,13 @@ void bench(Host& host, const juce::String& modelPath, double seconds) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    const bool benchMode = argc == 7 && juce::String(argv[4]) == "bench";
-    if (argc != 4 && !benchMode) {
-        std::printf("usage: %s <plugin.vst3> <golden dir> <work dir> [bench <model.bin> <seconds>]\n", argv[0]);
+    const bool benchMode = argc == 6 && juce::String(argv[3]) == "bench";
+    if (argc != 3 && !benchMode) {
+        std::printf("usage: %s <plugin.vst3> <golden dir> [bench <model.bin> <seconds>]\n", argv[0]);
         return 2;
     }
     const auto cwd = juce::File::getCurrentWorkingDirectory();
     goldenDir = cwd.getChildFile(juce::String::fromUTF8(argv[2])).getFullPathName();
-    workDir = cwd.getChildFile(juce::String::fromUTF8(argv[3]));
-    workDir.createDirectory();
-    // The analysis' test hook (DocumentController.cpp): read when the plugin first analyses
-    const juce::String holdPath = workDir.getChildFile("hold").getFullPathName();
-    workDir.getChildFile("hold").deleteFile();
-#if defined(_WIN32)
-    SetEnvironmentVariableW(L"ENM156_ARA_TEST_HOLD", holdPath.toWideCharPointer());
-#else
-    setenv("ENM156_ARA_TEST_HOLD", holdPath.toRawUTF8(), 1);
-#endif
     juce::ScopedJuceInitialiser_GUI juce;
 
     Host host;
@@ -1023,7 +1095,7 @@ int main(int argc, char** argv) {
     }
 
     if (benchMode) {
-        bench(host, cwd.getChildFile(juce::String::fromUTF8(argv[5])).getFullPathName(), std::atof(argv[6]));
+        bench(host, cwd.getChildFile(juce::String::fromUTF8(argv[4])).getFullPathName(), std::atof(argv[5]));
         host.factory = {};  // releases the plugin's ARA factory while the module is loaded
         host.keepLoaded.reset();
         return failures == 0 ? 0 : 1;
