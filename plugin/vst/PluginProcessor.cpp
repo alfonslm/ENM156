@@ -86,6 +86,9 @@ void DenoiserProcessor::collectGarbage() {
 
 void DenoiserProcessor::prepareToPlay(double sampleRate, int maximumExpectedSamplesPerBlock) {
 #if JucePlugin_Enable_ARA
+    // Bound to ARA: the renderer applies this instance's mix and bypass
+    if (auto* renderer = getPlaybackRenderer<DenoiserPlaybackRenderer>())
+        renderer->setParameters(mixParam_, bypassParam_);
     prepareToPlayForARA(sampleRate, maximumExpectedSamplesPerBlock, getMainBusNumOutputChannels(),
                         getProcessingPrecision());
 #else
@@ -261,6 +264,24 @@ void DenoiserProcessor::getStateInformation(juce::MemoryBlock& destData) {
     info->setAttribute("description", s.description);
     info->setAttribute("message", s.message);
     info->setAttribute("latencySamples", s.latencySamples);
+#if JucePlugin_Enable_ARA
+    // Also for information only: the ARA document's model and sources (the
+    // document's settings themselves are saved in its ARA archive)
+    if (auto* dc = getAraDocumentController()) {
+        const auto model = dc->getModelStatus();
+        auto* ara = xml.createNewChildElement("ARA");
+        ara->setAttribute("modelPath", model.path);
+        ara->setAttribute("description", model.description);
+        ara->setAttribute("message", model.message);
+        ara->setAttribute("highBand", model.highBand == denoiser::HighBand::PassThrough ? 1 : 0);
+        for (const auto& source : dc->getSourceStatuses()) {
+            auto* e = ara->createNewChildElement("Source");
+            e->setAttribute("name", source.name);
+            e->setAttribute("state", DenoiserDocumentController::describe(source.state));
+            e->setAttribute("message", source.message);
+        }
+    }
+#endif
     copyXmlToBinary(xml, destData);
 }
 
@@ -332,8 +353,8 @@ void DenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mid
     juce::ScopedNoDenormals noDenormals;
 
 #if JucePlugin_Enable_ARA
-    // Bound to an ARA document: the ARA playback renderer fills the buffer.
-    // Its default renderer (no document controller logic yet) outputs silence.
+    // Bound to an ARA document: the ARA playback renderer fills the buffer
+    // with the regions' stored (denoised) audio
     if (processBlockForARA(buffer, isRealtime(), getPlayHead()))
         return;
 #endif
@@ -346,8 +367,16 @@ void DenoiserProcessor::processBlockBypassed(juce::AudioBuffer<float>& buffer, j
     juce::ignoreUnused(midi);
     juce::ScopedNoDenormals noDenormals;
 #if JucePlugin_Enable_ARA
-    if (isBoundToARA())
-        return;  // ARA playback has no latency: the input as it is
+    if (isBoundToARA()) {
+        // The regions' original audio (ARA playback has no latency)
+        auto* renderer = getPlaybackRenderer<DenoiserPlaybackRenderer>();
+        if (renderer != nullptr)
+            renderer->setForceBypass(true);
+        processBlockForARA(buffer, isRealtime(), getPlayHead());
+        if (renderer != nullptr)
+            renderer->setForceBypass(false);
+        return;
+    }
 #endif
     process(buffer, true);
 }

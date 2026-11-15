@@ -1,7 +1,9 @@
 #pragma once
 // The plugin's AudioProcessor: the real-time denoiser (VST3 effect, mono or
-// stereo, input layout == output layout), and the ARA entry points (the ARA
-// playback renderer is a later issue). See ../README.md, "The VST3 plugin".
+// stereo, input layout == output layout), and the ARA entry points: bound to
+// an ARA document, processBlock hands the block to the ARA playback renderer
+// (DocumentController.h) and the real-time engine is not used. See
+// ../README.md, "The VST3 effect" and "ARA".
 //
 // Threads
 // -------
@@ -31,6 +33,10 @@
 // prepareToPlay and reset() start from silence instead (a full reset).
 
 #include "RealtimeEngine.h"
+
+#if JucePlugin_Enable_ARA
+#include "DocumentController.h"
+#endif
 
 #include <juce_audio_processors/juce_audio_processors.h>
 
@@ -67,6 +73,13 @@ public:
     juce::AudioProcessorParameter* getBypassParameter() const override;
 #if JucePlugin_Enable_ARA
     juce::AudioProcessorARAExtension* getARAClientExtensions() override { return this; }
+    // The ARA document this instance is bound to (null if it isn't): there,
+    // the model is a document setting (see DocumentController.h)
+    DenoiserDocumentController* getAraDocumentController() const noexcept {
+        return isBoundToARA() ? DenoiserDocumentController::from(
+                                    juce::AudioProcessorARAExtension::getDocumentController())
+                              : nullptr;
+    }
 #endif
 
     bool hasEditor() const override { return true; }
