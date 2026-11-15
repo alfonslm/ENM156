@@ -222,7 +222,7 @@ double relErr(const std::vector<float>& a, size_t aStart, const std::vector<floa
 double relErr(const Audio& a, const Audio& b) {
     double worst = 0.0;
     for (size_t c = 0; c < a.size(); ++c)
-        worst = std::max(worst, relErr(a[c], 0, b[c], 0, a[c].size()));
+        worst = std::max(worst, relErr(a[c], 0, b[c], 0, std::min(a[c].size(), b[c].size())));
     return worst;
 }
 
