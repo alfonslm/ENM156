@@ -24,7 +24,8 @@
 // The old engine keeps running and stays audible until the new one has been
 // fed for its latency plus its widest analysis window (so its output depends
 // only on real input), then a 10 ms linear crossfade switches to it. No gap
-// and no click; CPU doubles for those ~30 ms. The host is told the new
+// and no click; CPU doubles meanwhile (~100 ms with config.toml's 80 ms long
+// window). The host is told the new
 // latency (setLatencySamples) by the control thread when the engine is
 // handed over; it only changes if the new model's hop / n_fft differ.
 // prepareToPlay and reset() start from silence instead (a full reset).
