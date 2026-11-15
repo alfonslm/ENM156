@@ -139,7 +139,7 @@ def main():
     ap.add_argument("--samples-dir", default=None,
                     help="Score saved clean/noisy/denoised triples (default mode; "
                          "defaults to <train.output_dir>/samples).")
-    ap.add_argument("--model", default="runs/default/model.pt",
+    ap.add_argument("--model", default=None,
                     help="Instead, run this model.pt over test clips and score it.")
     ap.add_argument("--num-clips", type=int, default=824)
     ap.add_argument("--split", default="test", choices=("test", "val"),
@@ -147,6 +147,9 @@ def main():
     ap.add_argument("--every", type=int, default=1, help="Score each Nth clip of the split only.")
     add_config_args(ap)
     args = ap.parse_args()
+    if args.model and args.samples_dir:
+        # one would be ignored: say so instead of scoring something else than asked
+        ap.error("--model and --samples-dir pick different things to score; give one of them")
     cfg = load_config(args.set)
 
     if args.model:

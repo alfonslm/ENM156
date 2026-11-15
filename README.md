@@ -38,6 +38,7 @@ training audio doesn't fit in your VRAM.
 .venv/bin/python tests/test_snn_neurons.py                  # spiking neurons on hand-made inputs
 .venv/bin/python tests/test_snn_stream.py                   # spiking network: live == offline == frame by frame
 .venv/bin/python tests/test_snn_stats.py                    # operation counts against counts by hand
+.venv/bin/python tests/test_evaluate_modes.py               # evaluate.py: saved samples vs --model
 ```
 
 Each checkpoint stores the `stft` and `model` settings it was trained with,
