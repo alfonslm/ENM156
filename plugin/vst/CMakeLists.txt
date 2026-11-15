@@ -35,6 +35,13 @@ target_compile_definitions(DenoiserPlugin
         JUCE_USE_CURL=0
         JUCE_VST3_CAN_REPLACE_VST2=0)
 
+# For validation builds only: a model file every new instance loads before
+# any state is restored (pluginval and Steinberg's validator can't load one)
+set(DENOISER_DEFAULT_MODEL "" CACHE FILEPATH "Validation builds only: model file a new plugin instance loads")
+if(DENOISER_DEFAULT_MODEL)
+    target_compile_definitions(DenoiserPlugin PRIVATE DENOISER_DEFAULT_MODEL="${DENOISER_DEFAULT_MODEL}")
+endif()
+
 target_link_libraries(DenoiserPlugin
     PRIVATE
         denoiser::core

@@ -376,23 +376,29 @@ void bench(const std::vector<juce::String>& files, double seconds) {
                 p->loadModelFile(juce::File::getCurrentWorkingDirectory().getChildFile(file));
             setParam(*p, DenoiserProcessor::kHighBandId, highPass ? 1.0f : 0.0f);
             p->prepareToPlay(rate, block);
-            double best = 1e30;
+            double best = 1e30, worstBlock = 0.0;
             for (int run = 0; run < 3; ++run) {
                 p->reset();
-                double total = 0.0;
+                double total = 0.0, slowest = 0.0;
                 for (int b = 0; b < blocks; ++b) {
                     juce::AudioBuffer<float> buffer(data, channels, block);
                     fillNoise(buffer, random);
                     const auto t0 = std::chrono::steady_clock::now();
                     p->processBlock(buffer, midi);
-                    total += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                    const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                    total += t;
+                    slowest = std::max(slowest, t);
                 }
-                best = std::min(best, total);
+                if (total < best) {
+                    best = total;
+                    worstBlock = slowest;
+                }
             }
             const auto s = p->getStatus();
-            std::printf("%s, high band %s: %.2f %% of one core (%.1f ms per second of audio); %s\n",
+            std::printf("%s, high band %s: %.2f %% of one core (%.1f ms per second of audio), slowest block "
+                        "%.0f %% of its duration; %s\n",
                         file.toRawUTF8(), highPass ? "pass" : "drop", 100.0 * best / seconds, 1000.0 * best / seconds,
-                        s.denoising ? s.description.toRawUTF8() : "pass-through");
+                        100.0 * worstBlock * rate / block, s.denoising ? s.description.toRawUTF8() : "pass-through");
         }
     }
 }

@@ -48,8 +48,14 @@ DenoiserProcessor::DenoiserProcessor()
     highBandParam_ = parameters_.getRawParameterValue(kHighBandId);
     {
         std::lock_guard<std::mutex> lock(controlMutex_);
+#ifdef DENOISER_DEFAULT_MODEL
+        // Validation builds only (CMake DENOISER_DEFAULT_MODEL): start with a
+        // model, so validators that can't restore a state test the denoiser
+        loadPathLocked(juce::String::fromUTF8(DENOISER_DEFAULT_MODEL));
+#else
         loadMessage_ = noModelMessage();
         reportLocked(nullptr);
+#endif
     }
     startTimerHz(10);
 }
