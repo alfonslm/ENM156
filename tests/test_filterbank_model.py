@@ -2,7 +2,9 @@
 Checks a denoiser on a learned filterbank (model.filterbank) where it isn't
 covered elsewhere: that train.py refuses one up front, whether set in the
 settings or in the checkpoint it starts from, instead of failing on a shape
-mismatch. Uses an untrained filterbank and model; no dataset is needed.
+mismatch; and that the operations per second evaluate.py prints count the
+filterbank's frames (one per stride), not the STFT's. Uses an untrained
+filterbank and model; no dataset is needed.
 
   .venv/bin/python tests/test_filterbank_model.py
 """
@@ -20,6 +22,7 @@ from denoiser.config import load_config  # noqa: E402
 from denoiser.filterbank import Filterbank, save_filterbank  # noqa: E402
 from denoiser.model import make_model, save_checkpoint  # noqa: E402
 from denoiser.pipeline import segment_frames  # noqa: E402
+from denoiser.snn.stats import CostMeter, describe_cost, macs_per_frame  # noqa: E402
 
 FB = {"filters": 64, "kernel": 32, "stride": 16, "relu": True}
 
@@ -56,6 +59,14 @@ def main():
             checks["the mismatch train.py would hit"] = False
         except RuntimeError:
             checks["the mismatch train.py would hit"] = True
+
+        # operations per second: 16000 / stride = 1000 frames/s on the filterbank,
+        # 16000 / stft.hop = 200 with the STFT
+        for name, c in (("filterbank", cfg), ("stft", load_config(["model.output=mask"]))):
+            net = make_model(c)
+            fps = c["data"]["sample_rate"] / (FB["stride"] if name == "filterbank" else c["stft"]["hop"])
+            expected = f"{macs_per_frame(net) * fps / 1e6:.1f} M MACs/s"
+            checks[f"cost per second, {name}"] = describe_cost(CostMeter(net).cost(), c).startswith(expected)
 
         run_dir = tmp / "run"
         msg = run_train([*fb_settings, "--set", f"train.output_dir={run_dir}"])
