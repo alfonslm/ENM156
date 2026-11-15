@@ -58,6 +58,7 @@ struct DenoiserDocumentController::Source {
     bool running = false;   // the analysis thread works on it
     unsigned needs = kAll;
     std::map<int, std::shared_ptr<AudioSlot>> slots;  // by playback rate
+    std::shared_ptr<const enm156::ara::SourceAudio> mainAudio;  // the latest at the source's rate
     SourceState state = SourceState::Waiting;
     float progress = 0.0f;
     juce::String message;
@@ -379,6 +380,10 @@ std::shared_ptr<AudioSlot> DenoiserDocumentController::slotFor(juce::ARAAudioSou
         if (!entry) {
             entry = std::make_shared<AudioSlot>();
             created = true;
+            // At the source's rate: what the analysis has now (no reader can
+            // hold the new slot yet, so this doesn't wait)
+            if (rateKey(rate) == rateKey(source.rate) && source.mainAudio)
+                entry->publish(source.mainAudio);
             // A version at this rate: made from what the analysis has (or will have)
             requestLocked(source, kPublish);
         }
@@ -514,16 +519,20 @@ DenoiserDocumentController::ReadResult DenoiserDocumentController::readSource(So
 }
 
 void DenoiserDocumentController::publishAll(Source& source, denoiser::HighBand highBand) {
+    // The version at the source's own rate is kept, so that a slot made later
+    // (a renderer prepared while the analysis is busy) starts with it at once
+    const auto main = source.analysis.atSourceRate(highBand);
     std::vector<std::pair<int, std::shared_ptr<AudioSlot>>> slots;
     double rate;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        source.mainAudio = main;
         slots.assign(source.slots.begin(), source.slots.end());
         rate = source.rate;
     }
     for (auto& entry : slots) {
         if (entry.first == rateKey(rate))
-            entry.second->publish(source.analysis.atSourceRate(highBand));
+            entry.second->publish(main);
         else
             entry.second->publish(source.analysis.atRate(entry.first));
     }

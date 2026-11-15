@@ -663,14 +663,11 @@ void testBeforeAnalysis(Host& host) {
     auto& src = doc->addSource(data, 48000, "source-h");
     doc->addRegion(src, 0.0, 0.5, 0.0);
     check(doc->restore(settingsArchive(path)), "restore");
-    // Realtime: wait until the source has been read (the original is there), then render
-    Audio out;
-    for (int attempt = 0; attempt < 500; ++attempt) {
-        out = doc->render(48000, 0, 24000, true);
-        if (!isSilent(out[0], 0, 24000))
-            break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
+    // Wait until the source has been read and the analysis waits at the hold
+    // (the window then says "denoising 0 %"), then render in realtime
+    for (int attempt = 0; attempt < 2000 && !sourceStatus(*doc->plugin).contains("denoising"); ++attempt)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    Audio out = doc->render(48000, 0, 24000, true);
     check(sameSamples(out[0], 0, data[0], 0, 24000) && sameSamples(out[1], 0, data[1], 0, 24000),
           "before the analysis finished: not the original audio, bit for bit");
     check(sourceStatus(*doc->plugin).contains("denoising"), "status while held: " + sourceStatus(*doc->plugin));
@@ -850,11 +847,11 @@ void testEdgeSources(Host& host) {
     check(sameSamples(out[0], 0, shortData[0], 0, shortData[0].size()), "too short: the original");
     const juce::String status = sourceStatus(*doc->plugin);
     std::printf("  %s\n", status.toRawUTF8());
-    check(status.contains("Too short"), "too-short message");
+    check(status.contains("Too short"), "too-short message: " + status);
     // The 8 kHz source can't be resampled for 48 kHz playback: silence there (and a message)
-    out = doc->render(48000, 96000, 24000, false);
+    out = doc->render(48000, 96000, 24000, false);  // waits for that source's analysis
     check(isSilent(out[0], 0, 24000), "8 kHz source at 48 kHz: silence");
-    check(status.contains("not supported"), "8 kHz message");
+    check(sourceStatus(*doc->plugin).contains("not supported"), "8 kHz message: " + sourceStatus(*doc->plugin));
     // ... and at its own rate, the original
     out = doc->render(8000, 16000, 4000, false);
     check(sameSamples(out[0], 0, lowData[0], 0, 4000), "8 kHz source at 8 kHz: the original");
