@@ -488,8 +488,9 @@ progress stops and starts again when access returns).
   published. **Hand-over without locks**: the analysis thread stores the new
   pointer, then waits until no audio thread can still read the old one, then
   frees it (a "left-right" scheme with two reader counters); an audio thread
-  registers on one counter, loads the pointer, renders, and leaves: two
-  atomic increments per region and block, no allocation, no lock, no wait.
+  registers on one counter, loads the pointer, renders, and leaves: an
+  atomic increment and decrement per region and 256-sample chunk, no
+  allocation, no lock, no wait.
   The analysis thread is the only one that ever waits (for at most one
   render block). The slot also has a `working` flag (analysis queued or
   running for it), used by offline renders.
@@ -538,8 +539,8 @@ source sound different depending on which instance happens to render it. So:
   absolute path (referenced, not embedded, as in VST3 mode) and the high-band
   choice. **The audio is not stored**: on restore the model is loaded again
   and every source is analysed again (the issue's recommendation; a cache is
-  a later improvement). An empty archive (from before this version) restores
-  as "no model"; a newer version is refused (restore fails). A missing model
+  a later improvement). An empty archive (from before this version) changes
+  nothing (a new document starts with no model); a newer version is refused (restore fails). A missing model
   file leaves the original playing with "Model file not found: <path>", and
   the path is kept, so saving again doesn't lose it. The archive ID stays
   `org.enm156.denoiser.aradocumentarchive.1` (the earlier plugin stored
