@@ -1,0 +1,903 @@
+{
+ "about": "Golden vectors for the C++ port; written by plugin/tools/make_golden.py, format in plugin/tools/README.md. Untrained models (fixed seeds), synthetic clip.",
+ "torch_version": "2.15.0",
+ "numpy_version": "2.5.4",
+ "sample_rate": 16000,
+ "cases": [
+  {
+   "name": "mlp_magnitude_default",
+   "exercises": "the repo's default STFT (n_fft 128, hop 80, long window 1280 = not a power of two); relu output, expm1",
+   "description": "magnitude mlp 130 -> 24 -> 16 -> 65; causal frames of 128 samples (8 ms), hop 80, long window 1280 samples (80 ms)",
+   "model_file": "mlp_magnitude_default.model.bin",
+   "vectors_file": "mlp_magnitude_default.vectors.bin",
+   "realtime": true,
+   "net": "mlp",
+   "output": "magnitude",
+   "n_fft": 128,
+   "hop": 80,
+   "long_factor": 10,
+   "n_in": 130,
+   "n_out": 65,
+   "context_frames": 1,
+   "n_samples": 1600,
+   "n_frames": 21,
+   "stream": {
+    "delay": 48,
+    "chunks": 21,
+    "input_zeros": 80,
+    "max_abs_diff_vs_offline": 1.1175870895385742e-08
+   },
+   "tensors": {
+    "input": [
+     1600
+    ],
+    "window": [
+     128
+    ],
+    "long_window": [
+     1280
+    ],
+    "spec": [
+     21,
+     130
+    ],
+    "long_mag": [
+     21,
+     65
+    ],
+    "x": [
+     21,
+     130
+    ],
+    "pred": [
+     21,
+     65
+    ],
+    "out_spec": [
+     21,
+     130
+    ],
+    "offline": [
+     1600
+    ],
+    "streamed": [
+     1680
+    ]
+   }
+  },
+  {
+   "name": "mlp_magnitude_short",
+   "exercises": "no long window, hop 64",
+   "description": "magnitude mlp 65 -> 24 -> 16 -> 65; causal frames of 128 samples (8 ms), hop 64",
+   "model_file": "mlp_magnitude_short.model.bin",
+   "vectors_file": "mlp_magnitude_short.vectors.bin",
+   "realtime": true,
+   "net": "mlp",
+   "output": "magnitude",
+   "n_fft": 128,
+   "hop": 64,
+   "long_factor": 0,
+   "n_in": 65,
+   "n_out": 65,
+   "context_frames": 1,
+   "n_samples": 1600,
+   "n_frames": 27,
+   "stream": {
+    "delay": 64,
+    "chunks": 26,
+    "input_zeros": 64,
+    "max_abs_diff_vs_offline": 7.450580596923828e-09
+   },
+   "tensors": {
+    "input": [
+     1600
+    ],
+    "x": [
+     27,
+     65
+    ],
+    "pred": [
+     27,
+     65
+    ],
+    "offline": [
+     1600
+    ],
+    "streamed": [
+     1664
+    ]
+   }
+  },
+  {
+   "name": "mlp_mask_default",
+   "exercises": "mask output (sigmoid), noisy magnitude times gain",
+   "description": "mask mlp 130 -> 24 -> 16 -> 65; causal frames of 128 samples (8 ms), hop 80, long window 1280 samples (80 ms)",
+   "model_file": "mlp_mask_default.model.bin",
+   "vectors_file": "mlp_mask_default.vectors.bin",
+   "realtime": true,
+   "net": "mlp",
+   "output": "mask",
+   "n_fft": 128,
+   "hop": 80,
+   "long_factor": 10,
+   "n_in": 130,
+   "n_out": 65,
+   "context_frames": 1,
+   "n_samples": 1600,
+   "n_frames": 21,
+   "stream": {
+    "delay": 48,
+    "chunks": 21,
+    "input_zeros": 80,
+    "max_abs_diff_vs_offline": 1.4901161193847656e-08
+   },
+   "tensors": {
+    "input": [
+     1600
+    ],
+    "long_mag": [
+     21,
+     65
+    ],
+    "x": [
+     21,
+     130
+    ],
+    "pred": [
+     21,
+     65
+    ],
+    "offline": [
+     1600
+    ],
+    "streamed": [
+     1680
+    ]
+   }
+  },
+  {
+   "name": "mlp_complex_default",
+   "exercises": "complex_mask with the repo defaults: compress 0.3, mag_input on, mask_bound 1.0",
+   "description": "complex_mask mlp 260 -> 24 -> 16 -> 130; causal frames of 128 samples (8 ms), hop 80, long window 1280 samples (80 ms)",
+   "model_file": "mlp_complex_default.model.bin",
+   "vectors_file": "mlp_complex_default.vectors.bin",
+   "realtime": true,
+   "net": "mlp",
+   "output": "complex_mask",
+   "n_fft": 128,
+   "hop": 80,
+   "long_factor": 10,
+   "n_in": 260,
+   "n_out": 130,
+   "context_frames": 1,
+   "n_samples": 1600,
+   "n_frames": 21,
+   "stream": {
+    "delay": 48,
+    "chunks": 21,
+    "input_zeros": 80,
+    "max_abs_diff_vs_offline": 2.60770320892334e-08
+   },
+   "tensors": {
+    "input": [
+     1600
+    ],
+    "window": [
+     128
+    ],
+    "long_window": [
+     1280
+    ],
+    "spec": [
+     21,
+     130
+    ],
+    "long_mag": [
+     21,
+     65
+    ],
+    "x": [
+     21,
+     260
+    ],
+    "pred": [
+     21,
+     130
+    ],
+    "out_spec": [
+     21,
+     130
+    ],
+    "offline": [
+     1600
+    ],
+    "streamed": [
+     1680
+    ]
+   }
+  },
+  {
+   "name": "mlp_complex_plain",
+   "exercises": "complex_mask as in old checkpoints: real/imag input only, no mask bound; n_fft 256 with hop 128 (50% overlap)",
+   "description": "complex_mask mlp 258 -> 24 -> 16 -> 258; causal frames of 256 samples (16 ms), hop 128",
+   "model_file": "mlp_complex_plain.model.bin",
+   "vectors_file": "mlp_complex_plain.vectors.bin",
+   "realtime": true,
+   "net": "mlp",
+   "output": "complex_mask",
+   "n_fft": 256,
+   "hop": 128,
+   "long_factor": 0,
+   "n_in": 258,
+   "n_out": 258,
+   "context_frames": 1,
+   "n_samples": 1600,
+   "n_frames": 14,
+   "stream": {
+    "delay": 128,
+    "chunks": 14,
+    "input_zeros": 192,
+    "max_abs_diff_vs_offline": 7.450580596923828e-08
+   },
+   "tensors": {
+    "input": [
+     1600
+    ],
+    "x": [
+     14,
+     258
+    ],
+    "pred": [
+     14,
+     258
+    ],
+    "offline": [
+     1600
+    ],
+    "streamed": [
+     1792
+    ]
+   }
+  },
+  {
+   "name": "mlp_complex_long4",
+   "exercises": "complex_mask with compress 0.5 and mask_bound 1.5 (no constants baked in); n_fft 64, long window 256",
+   "description": "complex_mask mlp 132 -> 24 -> 16 -> 66; causal frames of 64 samples (4 ms), hop 32, long window 256 samples (16 ms)",
+   "model_file": "mlp_complex_long4.model.bin",
+   "vectors_file": "mlp_complex_long4.vectors.bin",
+   "realtime": true,
+   "net": "mlp",
+   "output": "complex_mask",
+   "n_fft": 64,
+   "hop": 32,
+   "long_factor": 4,
+   "n_in": 132,
+   "n_out": 66,
+   "context_frames": 1,
+   "n_samples": 1600,
+   "n_frames": 52,
+   "stream": {
+    "delay": 32,
+    "chunks": 51,
+    "input_zeros": 32,
+    "max_abs_diff_vs_offline": 4.470348358154297e-08
+   },
+   "tensors": {
+    "input": [
+     1600
+    ],
+    "window": [
+     64
+    ],
+    "long_window": [
+     256
+    ],
+    "spec": [
+     52,
+     66
+    ],
+    "long_mag": [
+     52,
+     33
+    ],
+    "x": [
+     52,
+     132
+    ],
+    "pred": [
+     52,
+     66
+    ],
+    "out_spec": [
+     52,
+     66
+    ],
+    "offline": [
+     1600
+    ],
+    "streamed": [
+     1632
+    ]
+   }
+  },
+  {
+   "name": "tcn_mask_short",
+   "exercises": "TCN with kernel 2 (context 16 frames)",
+   "description": "mask tcn 65 -> 12 channels x 4 blocks (dilations [1, 2, 4, 8]) -> 65, sees 16 frames (60 ms of history); causal frames of 128 samples (8 ms), hop 64",
+   "model_file": "tcn_mask_short.model.bin",
+   "vectors_file": "tcn_mask_short.vectors.bin",
+   "realtime": true,
+   "net": "tcn",
+   "output": "mask",
+   "n_fft": 128,
+   "hop": 64,
+   "long_factor": 0,
+   "n_in": 65,
+   "n_out": 65,
+   "context_frames": 16,
+   "n_samples": 1600,
+   "n_frames": 27,
+   "stream": {
+    "delay": 64,
+    "chunks": 26,
+    "input_zeros": 64,
+    "max_abs_diff_vs_offline": 1.4901161193847656e-08
+   },
+   "tensors": {
+    "input": [
+     1600
+    ],
+    "x": [
+     27,
+     65
+    ],
+    "pred": [
+     27,
+     65
+    ],
+    "offline": [
+     1600
+    ],
+    "streamed": [
+     1664
+    ]
+   }
+  },
+  {
+   "name": "tcn_magnitude_default",
+   "exercises": "TCN with the default dilations 1..32: context 127 frames, longer than the whole clip (21 frames), so every frame depends on the zero start-up frames; per-block channels in tcn.h*",
+   "description": "magnitude tcn 130 -> 12 channels x 6 blocks (dilations [1, 2, 4, 8, 16, 32]) -> 65, sees 127 frames (630 ms of history); causal frames of 128 samples (8 ms), hop 80, long window 1280 samples (80 ms)",
+   "model_file": "tcn_magnitude_default.model.bin",
+   "vectors_file": "tcn_magnitude_default.vectors.bin",
+   "realtime": true,
+   "net": "tcn",
+   "output": "magnitude",
+   "n_fft": 128,
+   "hop": 80,
+   "long_factor": 10,
+   "n_in": 130,
+   "n_out": 65,
+   "context_frames": 127,
+   "n_samples": 1600,
+   "n_frames": 21,
+   "stream": {
+    "delay": 48,
+    "chunks": 21,
+    "input_zeros": 80,
+    "max_abs_diff_vs_offline": 3.725290298461914e-08
+   },
+   "tensors": {
+    "input": [
+     1600
+    ],
+    "long_mag": [
+     21,
+     65
+    ],
+    "x": [
+     21,
+     130
+    ],
+    "pred": [
+     21,
+     65
+    ],
+    "offline": [
+     1600
+    ],
+    "streamed": [
+     1680
+    ],
+    "tcn.h0": [
+     21,
+     12
+    ],
+    "tcn.h1": [
+     21,
+     12
+    ],
+    "tcn.h2": [
+     21,
+     12
+    ],
+    "tcn.h3": [
+     21,
+     12
+    ],
+    "tcn.h4": [
+     21,
+     12
+    ],
+    "tcn.h5": [
+     21,
+     12
+    ],
+    "tcn.h6": [
+     21,
+     12
+    ]
+   }
+  },
+  {
+   "name": "tcn_complex_long3",
+   "exercises": "TCN complex_mask with mag_input and mask_bound; odd long_factor 3 (pooling padding 1, long window 384)",
+   "description": "complex_mask tcn 260 -> 12 channels x 4 blocks (dilations [1, 2, 4, 8]) -> 130, sees 31 frames (120 ms of history); causal frames of 128 samples (8 ms), hop 64, long window 384 samples (24 ms)",
+   "model_file": "tcn_complex_long3.model.bin",
+   "vectors_file": "tcn_complex_long3.vectors.bin",
+   "realtime": true,
+   "net": "tcn",
+   "output": "complex_mask",
+   "n_fft": 128,
+   "hop": 64,
+   "long_factor": 3,
+   "n_in": 260,
+   "n_out": 130,
+   "context_frames": 31,
+   "n_samples": 1600,
+   "n_frames": 27,
+   "stream": {
+    "delay": 64,
+    "chunks": 26,
+    "input_zeros": 64,
+    "max_abs_diff_vs_offline": 3.725290298461914e-08
+   },
+   "tensors": {
+    "input": [
+     1600
+    ],
+    "long_mag": [
+     27,
+     65
+    ],
+    "x": [
+     27,
+     260
+    ],
+    "pred": [
+     27,
+     130
+    ],
+    "offline": [
+     1600
+    ],
+    "streamed": [
+     1664
+    ]
+   }
+  },
+  {
+   "name": "tcn_complex_plain",
+   "exercises": "TCN complex_mask without mag_input and mask bound",
+   "description": "complex_mask tcn 130 -> 12 channels x 4 blocks (dilations [1, 2, 4, 8]) -> 130, sees 31 frames (120 ms of history); causal frames of 128 samples (8 ms), hop 64",
+   "model_file": "tcn_complex_plain.model.bin",
+   "vectors_file": "tcn_complex_plain.vectors.bin",
+   "realtime": true,
+   "net": "tcn",
+   "output": "complex_mask",
+   "n_fft": 128,
+   "hop": 64,
+   "long_factor": 0,
+   "n_in": 130,
+   "n_out": 130,
+   "context_frames": 31,
+   "n_samples": 1600,
+   "n_frames": 27,
+   "stream": {
+    "delay": 64,
+    "chunks": 26,
+    "input_zeros": 64,
+    "max_abs_diff_vs_offline": 2.384185791015625e-07
+   },
+   "tensors": {
+    "input": [
+     1600
+    ],
+    "x": [
+     27,
+     130
+    ],
+    "pred": [
+     27,
+     130
+    ],
+    "offline": [
+     1600
+    ],
+    "streamed": [
+     1664
+    ]
+   }
+  },
+  {
+   "name": "snn_complex_default",
+   "exercises": "SNN with the default STFT and complex_mask; spikes of each layer for the first 8 frames in snn.spikes*",
+   "description": "complex_mask snn 260 -> 24 -> 16 spiking neurons -> 130, 1 time step(s) per frame; causal frames of 128 samples (8 ms), hop 80, long window 1280 samples (80 ms)",
+   "model_file": "snn_complex_default.model.bin",
+   "vectors_file": "snn_complex_default.vectors.bin",
+   "realtime": true,
+   "net": "snn",
+   "output": "complex_mask",
+   "n_fft": 128,
+   "hop": 80,
+   "long_factor": 10,
+   "n_in": 260,
+   "n_out": 130,
+   "context_frames": 1,
+   "n_samples": 1600,
+   "n_frames": 21,
+   "stream": {
+    "delay": 48,
+    "chunks": 21,
+    "input_zeros": 80,
+    "max_abs_diff_vs_offline": 5.21540641784668e-08
+   },
+   "snn": {
+    "spike_rate_per_layer": [
+     0.3869,
+     0.4673
+    ],
+    "min_abs_v_minus_threshold": 0.004034951329231262,
+    "step_vs_forward_max_abs_diff": 4.76837158203125e-07,
+    "spike_frames": 8
+   },
+   "tensors": {
+    "input": [
+     1600
+    ],
+    "long_mag": [
+     21,
+     65
+    ],
+    "x": [
+     21,
+     260
+    ],
+    "pred": [
+     21,
+     130
+    ],
+    "offline": [
+     1600
+    ],
+    "streamed": [
+     1680
+    ],
+    "snn.spikes0": [
+     8,
+     24
+    ],
+    "snn.spikes1": [
+     8,
+     16
+    ]
+   }
+  },
+  {
+   "name": "snn_complex_recurrent",
+   "exercises": "SNN with recurrent weights",
+   "description": "complex_mask snn 195 -> 24 -> 16 spiking neurons (recurrent) -> 130, 1 time step(s) per frame; causal frames of 128 samples (8 ms), hop 64",
+   "model_file": "snn_complex_recurrent.model.bin",
+   "vectors_file": "snn_complex_recurrent.vectors.bin",
+   "realtime": true,
+   "net": "snn",
+   "output": "complex_mask",
+   "n_fft": 128,
+   "hop": 64,
+   "long_factor": 0,
+   "n_in": 195,
+   "n_out": 130,
+   "context_frames": 1,
+   "n_samples": 1600,
+   "n_frames": 27,
+   "stream": {
+    "delay": 64,
+    "chunks": 26,
+    "input_zeros": 64,
+    "max_abs_diff_vs_offline": 2.9802322387695312e-08
+   },
+   "snn": {
+    "spike_rate_per_layer": [
+     0.3951,
+     0.3125
+    ],
+    "min_abs_v_minus_threshold": 0.0006559789180755615,
+    "step_vs_forward_max_abs_diff": 2.384185791015625e-07,
+    "spike_frames": 0
+   },
+   "tensors": {
+    "input": [
+     1600
+    ],
+    "x": [
+     27,
+     195
+    ],
+    "pred": [
+     27,
+     130
+    ],
+    "offline": [
+     1600
+    ],
+    "streamed": [
+     1664
+    ]
+   }
+  },
+  {
+   "name": "snn_complex_steps3",
+   "exercises": "SNN with 3 time steps per frame; spikes of the first 4 frames (12 steps)",
+   "description": "complex_mask snn 195 -> 24 -> 16 spiking neurons -> 130, 3 time step(s) per frame; causal frames of 128 samples (8 ms), hop 64",
+   "model_file": "snn_complex_steps3.model.bin",
+   "vectors_file": "snn_complex_steps3.vectors.bin",
+   "realtime": true,
+   "net": "snn",
+   "output": "complex_mask",
+   "n_fft": 128,
+   "hop": 64,
+   "long_factor": 0,
+   "n_in": 195,
+   "n_out": 130,
+   "context_frames": 1,
+   "n_samples": 1600,
+   "n_frames": 27,
+   "stream": {
+    "delay": 64,
+    "chunks": 26,
+    "input_zeros": 64,
+    "max_abs_diff_vs_offline": 1.4901161193847656e-08
+   },
+   "snn": {
+    "spike_rate_per_layer": [
+     0.2948,
+     0.3302
+    ],
+    "min_abs_v_minus_threshold": 0.00031062960624694824,
+    "step_vs_forward_max_abs_diff": 4.76837158203125e-07,
+    "spike_frames": 4
+   },
+   "tensors": {
+    "input": [
+     1600
+    ],
+    "x": [
+     27,
+     195
+    ],
+    "pred": [
+     27,
+     130
+    ],
+    "offline": [
+     1600
+    ],
+    "streamed": [
+     1664
+    ],
+    "snn.spikes0": [
+     12,
+     24
+    ],
+    "snn.spikes1": [
+     12,
+     16
+    ]
+   }
+  },
+  {
+   "name": "snn_mask_recurrent_steps2",
+   "exercises": "SNN with one layer, recurrent and 2 steps per frame, mask output",
+   "description": "mask snn 65 -> 48 spiking neurons (recurrent) -> 65, 2 time step(s) per frame; causal frames of 128 samples (8 ms), hop 80",
+   "model_file": "snn_mask_recurrent_steps2.model.bin",
+   "vectors_file": "snn_mask_recurrent_steps2.vectors.bin",
+   "realtime": true,
+   "net": "snn",
+   "output": "mask",
+   "n_fft": 128,
+   "hop": 80,
+   "long_factor": 0,
+   "n_in": 65,
+   "n_out": 65,
+   "context_frames": 1,
+   "n_samples": 1600,
+   "n_frames": 21,
+   "stream": {
+    "delay": 48,
+    "chunks": 21,
+    "input_zeros": 80,
+    "max_abs_diff_vs_offline": 2.9802322387695312e-08
+   },
+   "snn": {
+    "spike_rate_per_layer": [
+     0.5114
+    ],
+    "min_abs_v_minus_threshold": 0.001439012587070465,
+    "step_vs_forward_max_abs_diff": 1.7881393432617188e-07,
+    "spike_frames": 0
+   },
+   "tensors": {
+    "input": [
+     1600
+    ],
+    "x": [
+     21,
+     65
+    ],
+    "pred": [
+     21,
+     65
+    ],
+    "offline": [
+     1600
+    ],
+    "streamed": [
+     1680
+    ]
+   }
+  },
+  {
+   "name": "snn_magnitude_nodecay",
+   "exercises": "SNN with decay 0 (stored as sigmoid(logit(1e-4)) ~ 1e-4), magnitude output",
+   "description": "magnitude snn 130 -> 24 -> 16 spiking neurons -> 65, 1 time step(s) per frame; causal frames of 128 samples (8 ms), hop 80, long window 1280 samples (80 ms)",
+   "model_file": "snn_magnitude_nodecay.model.bin",
+   "vectors_file": "snn_magnitude_nodecay.vectors.bin",
+   "realtime": true,
+   "net": "snn",
+   "output": "magnitude",
+   "n_fft": 128,
+   "hop": 80,
+   "long_factor": 10,
+   "n_in": 130,
+   "n_out": 65,
+   "context_frames": 1,
+   "n_samples": 1600,
+   "n_frames": 21,
+   "stream": {
+    "delay": 48,
+    "chunks": 21,
+    "input_zeros": 80,
+    "max_abs_diff_vs_offline": 6.705522537231445e-08
+   },
+   "snn": {
+    "spike_rate_per_layer": [
+     0.3571,
+     0.2976
+    ],
+    "min_abs_v_minus_threshold": 0.0006933510303497314,
+    "step_vs_forward_max_abs_diff": 2.384185791015625e-07,
+    "spike_frames": 0
+   },
+   "tensors": {
+    "input": [
+     1600
+    ],
+    "long_mag": [
+     21,
+     65
+    ],
+    "x": [
+     21,
+     130
+    ],
+    "pred": [
+     21,
+     65
+    ],
+    "offline": [
+     1600
+    ],
+    "streamed": [
+     1680
+    ]
+   }
+  },
+  {
+   "name": "offline_mlp_mask_centred",
+   "exercises": "centred frames (stft.causal = false, realtime = false): reflect padding, torch.istft synthesis; offline only, no streamed output",
+   "description": "mask mlp 130 -> 24 -> 16 -> 65; centred frames of 128 samples (8 ms), hop 80, long window 1280 samples (80 ms)",
+   "model_file": "offline_mlp_mask_centred.model.bin",
+   "vectors_file": "offline_mlp_mask_centred.vectors.bin",
+   "realtime": false,
+   "net": "mlp",
+   "output": "mask",
+   "n_fft": 128,
+   "hop": 80,
+   "long_factor": 10,
+   "n_in": 130,
+   "n_out": 65,
+   "context_frames": 1,
+   "n_samples": 1600,
+   "n_frames": 21,
+   "stream": null,
+   "tensors": {
+    "input": [
+     1600
+    ],
+    "window": [
+     128
+    ],
+    "long_window": [
+     1280
+    ],
+    "spec": [
+     21,
+     130
+    ],
+    "long_mag": [
+     21,
+     65
+    ],
+    "x": [
+     21,
+     130
+    ],
+    "pred": [
+     21,
+     65
+    ],
+    "out_spec": [
+     21,
+     130
+    ],
+    "offline": [
+     1600
+    ]
+   }
+  },
+  {
+   "name": "offline_tcn_complex_centred",
+   "exercises": "centred frames with a TCN and complex_mask; offline only",
+   "description": "complex_mask tcn 195 -> 12 channels x 4 blocks (dilations [1, 2, 4, 8]) -> 130, sees 31 frames (120 ms of history); centred frames of 128 samples (8 ms), hop 64",
+   "model_file": "offline_tcn_complex_centred.model.bin",
+   "vectors_file": "offline_tcn_complex_centred.vectors.bin",
+   "realtime": false,
+   "net": "tcn",
+   "output": "complex_mask",
+   "n_fft": 128,
+   "hop": 64,
+   "long_factor": 0,
+   "n_in": 195,
+   "n_out": 130,
+   "context_frames": 31,
+   "n_samples": 1600,
+   "n_frames": 26,
+   "stream": null,
+   "tensors": {
+    "input": [
+     1600
+    ],
+    "x": [
+     26,
+     195
+    ],
+    "pred": [
+     26,
+     130
+    ],
+    "offline": [
+     1600
+    ]
+   }
+  }
+ ]
+}
