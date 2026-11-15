@@ -10,7 +10,7 @@ run live (`denoiser/stream.py`) with a latency of one short window.
 
 ```bash
 python3 -m venv --system-site-packages .venv
-.venv/bin/pip install torch-pesq   # only needed for train_pesq.py
+.venv/bin/pip install -r requirements.txt   # what isn't in the system site-packages yet
 cp config.local.example.toml config.local.toml
 ```
 
