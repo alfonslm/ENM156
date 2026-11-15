@@ -857,6 +857,77 @@ void testEdgeSources(Host& host) {
     check(sameSamples(out[0], 0, lowData[0], 0, 4000), "8 kHz source at 8 kHz: the original");
 }
 
+// An audio thread renders in realtime, without pause, while the document
+// thread changes the model, the high band and a source's samples, so new
+// analysis results replace the ones being played (for ThreadSanitizer /
+// AddressSanitizer). Every block must be finite, and in the end the output
+// is the last model's.
+void testRenderWhileAnalysing(Host& host) {
+    std::printf("realtime rendering on another thread while the analysis replaces results\n");
+    const juce::String mlp = golden("mlp_magnitude_default.model.bin");
+    const juce::String snn = golden("snn_complex_default.model.bin");
+    const juce::String tcn = golden("tcn_magnitude_default.model.bin");
+    auto doc = host.createDocument(2);
+    if (!doc)
+        return;
+    const Audio a = noise(2, 48000, 91), b = noise(1, 24000, 92);
+    auto& sa = doc->addSource(a, 48000, "stress-a");
+    auto& sb = doc->addSource(b, 48000, "stress-b");
+    doc->addRegion(sa, 0.0, 1.0, 0.0);
+    doc->addRegion(sb, 0.0, 0.5, 0.25);
+    doc->plugin->releaseResources();
+    doc->plugin->setNonRealtime(false);
+    doc->plugin->prepareToPlay(48000, 512);
+    std::atomic<bool> stop{false};
+    std::atomic<long> blocks{0}, bad{0};
+    std::thread audio([&] {
+        std::vector<float> left(256), right(256);
+        float* ptrs[] = {left.data(), right.data()};
+        juce::MidiBuffer midi;
+        std::int64_t time = 0;
+        while (!stop.load()) {
+            juce::AudioBuffer<float> buffer(ptrs, 2, 256);
+            doc->playHead.time = time;
+            doc->plugin->processBlock(buffer, midi);
+            for (float v : left)
+                if (!std::isfinite(v) || std::fabs(v) > 100.0f)
+                    ++bad;
+            time = (time + 256) % 48000;
+            ++blocks;
+        }
+    });
+    const juce::String models[] = {mlp, snn, tcn, mlp};
+    for (int round = 0; round < 8; ++round) {
+        check(doc->restore(settingsArchive(models[round % 4], round % 3 == 1)), "restore");
+        if (round % 3 == 2) {
+            sb.source->enableAudioSourceSamplesAccess(false);
+            for (auto& v : sb.data->data[0])
+                v *= -1.0f;
+            sb.source->enableAudioSourceSamplesAccess(true);
+            const juce::ARAEditGuard guard(doc->dc());
+            doc->dc().updateAudioSourceContent(sb.source->getPluginRef(), nullptr,
+                                               ARA::ContentUpdateScopes::samplesAreAffected());
+        }
+        doc->notify();
+        std::this_thread::sleep_for(std::chrono::milliseconds(15 * (round % 4)));
+    }
+    doc->notify();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    stop = true;
+    audio.join();
+    std::printf("  %ld blocks rendered during 8 changes, %ld bad\n", blocks.load(), bad.load());
+    check(bad.load() == 0, "non-finite or wild output while results were replaced");
+    // Settles on the last settings (round 7: the MLP, high band passed through)
+    const Audio out = doc->render(48000, 0, 48000, false);
+    auto model = loadModel(mlp);
+    if (model) {
+        const auto hb = denoiser::HighBand::PassThrough;
+        const double err = compareChannels(out, {reference(*model, 48000, a[0], hb), reference(*model, 48000, a[1], hb)},
+                                           0, 0, 12000);
+        check(err <= kTolerance, "after the changes: not the last model's output, error " + juce::String(err));
+    }
+}
+
 #if DENOISER_COUNT_WRAPPER_ALLOCATIONS
 void testAllocations(Host& host) {
     std::printf("allocations while rendering ARA regions through the VST3 interface\n");
@@ -966,6 +1037,7 @@ int main(int argc, char** argv) {
         testChanges(host);
         testOtherPlaybackRate(host);
         testEdgeSources(host);
+        testRenderWhileAnalysing(host);
 #if DENOISER_COUNT_WRAPPER_ALLOCATIONS
         testAllocations(host);
 #endif
