@@ -1,7 +1,9 @@
 """
 Settings come from config.toml (shared defaults), then config.local.toml
 (personal, git-ignored), then --set section.key=value on the command line.
+Only settings config.toml defines can be set.
 """
+import difflib
 import json
 import sys
 import tomllib
@@ -38,14 +40,41 @@ def parse_set(item):
     return {section: {name: value}}
 
 
+def check_known(cfg, overrides, source):
+    """Refuses a section or key of `overrides` that config.toml (cfg) doesn't
+    define: merged in, a misspelt one (train.epoch) would be a new setting
+    nothing reads, and the run would go ahead with the default. Names the
+    nearest existing setting. Values aren't checked: any type can be meant."""
+    names = [f"{s}.{k}" for s, keys in cfg.items() for k in keys]
+    for section, values in overrides.items():
+        if section not in cfg:
+            near = difflib.get_close_matches(section, list(cfg), n=1)
+            hint = f"; did you mean [{near[0]}]?" if near else f"; config.toml has {', '.join(cfg)}"
+            raise SystemExit(f"{source}: config.toml has no section [{section}]{hint}")
+        if not isinstance(values, dict):
+            raise SystemExit(f"{source}: {section} is a section of config.toml, not a setting; "
+                             f"set one of its keys, e.g. {section}.{next(iter(cfg[section]))}")
+        for key in values:
+            if key not in cfg[section]:
+                # the same key in another section first (train.n_fft -> stft.n_fft)
+                near = ([n for n in names if n.partition(".")[2] == key]
+                        or difflib.get_close_matches(f"{section}.{key}", names, n=1))
+                hint = f"; did you mean {near[0]}?" if near else f"; see [{section}] in config.toml"
+                raise SystemExit(f"{source}: config.toml has no setting {section}.{key}{hint}")
+
+
 def load_config(overrides=()):
     with open(ROOT / "config.toml", "rb") as f:
         cfg = tomllib.load(f)
     if LOCAL_CONFIG.exists():
         with open(LOCAL_CONFIG, "rb") as f:
-            merge(cfg, tomllib.load(f))
+            local = tomllib.load(f)
+        check_known(cfg, local, LOCAL_CONFIG.name)
+        merge(cfg, local)
     for item in overrides:
-        merge(cfg, parse_set(item))
+        update = parse_set(item)
+        check_known(cfg, update, f"--set {item}")
+        merge(cfg, update)
     return cfg
 
 
