@@ -618,9 +618,11 @@ yet (they are written to be portable: no GCC-only code, the allocation count
 only on Linux/glibc, the test hook through an environment variable set with
 `SetEnvironmentVariableW` on Windows).
 
-- **ctest, Release (GCC 13, link-time optimisation)**: all 23 tests pass
+- **ctest, Release (GCC 13, link-time optimisation)**: all 22 tests pass
   (`plugin_ara` ~0.6 s, `plugin_ara_engine` ~1.1 s); `plugin_ara` and
   `plugin_ara_engine` also passed 30 times in a row.
+- **ctest, Clang 18 Debug**: all 22 pass; no compiler warning anywhere in
+  the build.
 - **ctest, Debug** (JUCE assertions and the ARA library's API validation,
   `ARA_VALIDATE_API_CALLS`, on in the plugin and in the host side): all pass,
   no assertion. That validation found the missing information URL.

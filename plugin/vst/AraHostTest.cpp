@@ -26,19 +26,18 @@
 #include <juce_events/juce_events.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <memory>
 #include <thread>
 #include <vector>
 
-#if defined(_WIN32)
-#include <windows.h>
-#endif
 
 #define DENOISER_COUNT_WRAPPER_ALLOCATIONS 0
 #if defined(__linux__) && defined(__GLIBC__) && !defined(__SANITIZE_ADDRESS__) && !defined(__SANITIZE_THREAD__)
@@ -61,6 +60,12 @@
 #if defined(__clang__)
 #pragma clang diagnostic pop
 #endif
+#endif
+
+#if defined(_WIN32)
+// From kernel32 (declared here rather than including <windows.h>, whose
+// macros clash with names in JUCE and the ARA SDK)
+extern "C" __declspec(dllimport) int __stdcall SetEnvironmentVariableW(const wchar_t* name, const wchar_t* value);
 #endif
 
 namespace {
