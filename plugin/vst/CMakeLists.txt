@@ -74,3 +74,40 @@ if(DENOISER_BUILD_TESTS)
     add_test(NAME plugin_vst3
         COMMAND denoiser_plugin_host_test "${denoiser_vst3_bundle}" "${PROJECT_SOURCE_DIR}/tests/golden")
 endif()
+
+# The processor class tested directly, without a plugin host: its sources
+# compiled into a console program with ARA off (ctest: plugin_processor_*).
+# Allocation counting replaces operator new / malloc; turn it off for
+# sanitizer builds (see README.md).
+if(DENOISER_BUILD_TESTS)
+    set(DENOISER_PROCESSOR_TEST_COUNT_ALLOCATIONS ON CACHE BOOL
+        "Count heap allocations in denoiser_processor_test (OFF under sanitizers)")
+    juce_add_console_app(denoiser_processor_test
+        PRODUCT_NAME "denoiser_processor_test"
+        NEEDS_WEB_BROWSER FALSE
+        NEEDS_CURL FALSE)
+    target_sources(denoiser_processor_test
+        PRIVATE
+            ProcessorTest.cpp
+            PluginProcessor.cpp
+            PluginEditor.cpp
+            RealtimeEngine.cpp)
+    target_compile_definitions(denoiser_processor_test
+        PRIVATE
+            JucePlugin_Enable_ARA=0
+            JUCE_WEB_BROWSER=0
+            JUCE_USE_CURL=0
+            DENOISER_COUNT_ALLOCATIONS=$<BOOL:${DENOISER_PROCESSOR_TEST_COUNT_ALLOCATIONS}>)
+    target_link_libraries(denoiser_processor_test
+        PRIVATE
+            denoiser::core
+            juce::juce_audio_processors
+        PUBLIC
+            juce::juce_recommended_config_flags
+            juce::juce_recommended_warning_flags)
+
+    set(golden_dir "${PROJECT_SOURCE_DIR}/tests/golden")
+    add_test(NAME plugin_processor_alloc COMMAND denoiser_processor_test alloc "${golden_dir}")
+    add_test(NAME plugin_processor_core COMMAND denoiser_processor_test core "${golden_dir}")
+    add_test(NAME plugin_processor_stress COMMAND denoiser_processor_test stress "${golden_dir}" 2)
+endif()

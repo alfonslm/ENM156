@@ -5,9 +5,12 @@
 // The same hooks as test_stft_alloc.cpp (which has them inline).
 //
 //   alloc::count([&] { ...code that must not allocate... })   -> number of allocations
+//   alloc::countOnThisThread([&] { ... })   -> the same, ignoring other threads
+//                                              (e.g. a framework's timer thread)
 #include <atomic>
 #include <cstdlib>
 #include <new>
+#include <thread>
 #if defined(_WIN32)
 #include <malloc.h>
 #endif
@@ -15,9 +18,12 @@
 namespace alloc {
 inline std::atomic<bool> armed{false};
 inline std::atomic<long> allocations{0};
+inline std::atomic<bool> oneThread{false};
+inline std::thread::id countedThread;  // written only while not armed
 
 inline void note() {
-    if (armed.load(std::memory_order_relaxed))
+    if (armed.load(std::memory_order_relaxed) &&
+        (!oneThread.load(std::memory_order_relaxed) || std::this_thread::get_id() == countedThread))
         allocations.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -28,6 +34,15 @@ long count(F&& f) {
     f();
     armed = false;
     return allocations.load();
+}
+
+template <class F>
+long countOnThisThread(F&& f) {
+    countedThread = std::this_thread::get_id();
+    oneThread = true;
+    const long n = count(f);
+    oneThread = false;
+    return n;
 }
 }  // namespace alloc
 
@@ -118,7 +133,8 @@ void* realloc(void* p, std::size_t n) {
     return __libc_realloc(p, n);
 }
 void free(void* p) {
-    alloc::note();
+    if (p != nullptr)  // free(nullptr) does nothing (JUCE calls it for empty buffers)
+        alloc::note();
     __libc_free(p);
 }
 }
