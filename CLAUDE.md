@@ -56,7 +56,11 @@ When work is split between several agents:
   dependency order, each from the branch it builds on.
 - The session that started a worker reviews that worker's pull request:
   it rebuilds and re-runs the tests itself and reads the diff before
-  approving, and says what it did not verify.
+  approving, and says what it did not verify. Once its review passes and CI
+  is green on Linux, Windows and macOS, that session **merges** the pull
+  request; it does not wait for the owner. (GitHub does not accept a formal
+  approval from the account that opened a pull request, so the approval is
+  recorded as a review comment.)
 - After its pull request is approved and merged, the worker **cleans up
   after itself**: its worktree, its local and remote branch, its build
   folders and any scratch files. A finished worker leaves nothing behind.
