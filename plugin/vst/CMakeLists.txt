@@ -114,8 +114,7 @@ if(DENOISER_BUILD_TESTS AND DENOISER_ENABLE_ARA)
             juce::juce_recommended_warning_flags)
     add_dependencies(denoiser_ara_host_test DenoiserPlugin_VST3)
     add_test(NAME plugin_ara
-        COMMAND denoiser_ara_host_test "${denoiser_vst3_bundle}" "${PROJECT_SOURCE_DIR}/tests/golden"
-                "${CMAKE_CURRENT_BINARY_DIR}/ara_work")
+        COMMAND denoiser_ara_host_test "${denoiser_vst3_bundle}" "${PROJECT_SOURCE_DIR}/tests/golden")
 endif()
 
 # The processor class tested directly, without a plugin host: its sources

@@ -26,15 +26,6 @@ int rateKey(double rate) {
     return int(std::lround(rate));
 }
 
-// Test hook (headless ARA host test only): while the file named by this
-// environment variable exists, the analysis waits before running the
-// network, so that "playback before analysis finishes" can be observed
-// deterministically. Unset in normal use.
-juce::File testHoldFile() {
-    static const juce::String path = juce::SystemStats::getEnvironmentVariable("ENM156_ARA_TEST_HOLD", {});
-    return path.isEmpty() ? juce::File() : juce::File(path);
-}
-
 }  // namespace
 
 struct DenoiserDocumentController::Source {
@@ -592,9 +583,6 @@ void DenoiserDocumentController::runJob(Source& source, unsigned job) {
         if ((job & kDenoise) != 0) {
             if (model)
                 setStatus(source, SourceState::Denoising, 0.0f, {});
-            const juce::File hold = testHoldFile();
-            while (hold != juce::File() && hold.exists() && !source.cancel.load() && !stop_)
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
             const Outcome outcome = source.analysis.denoise(model, [&](float fraction) {
                 if (source.cancel.load() || stop_)
                     return false;
