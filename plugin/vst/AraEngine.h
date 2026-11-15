@@ -42,17 +42,21 @@ using Planar = std::vector<std::vector<float>>;
 // stereo, like the plugin's buses); further channels are ignored
 constexpr int kMaxSourceChannels = 2;
 // Largest source the analysis takes, in samples (all channels together):
-// 2^29 = 93 minutes of 48 kHz stereo. The original and the denoised audio
-// are kept in memory as float32, so this is up to 4 GiB per source, plus
-// a third of that for the 16 kHz intermediates. Longer sources are not read:
-// they play silence and the editor says why.
-constexpr std::int64_t kMaxSourceSamples = std::int64_t(1) << 29;
+// 400 M = 69 minutes of 48 kHz stereo, 2.3 hours of 48 kHz mono. Everything
+// is kept in memory as float32: the original and the denoised audio at the
+// source's rate plus the 16 kHz input and output (a third each at 48 kHz),
+// so about 2.7 x 4 bytes per sample: up to 4.3 GB for a source at the limit
+// (an hour of 48 kHz stereo: 3.7 GB). Longer sources are not read: they play
+// silence and the editor says why.
+constexpr std::int64_t kMaxSourceSamples = 400'000'000;
 
 struct SourceAudio {
     double sampleRate = 0.0;  // of these samples
     int channels = 0;         // 1 or 2
     std::int64_t length = 0;  // samples per channel
-    Planar dry;               // the original (at another rate than the source's: through 16 kHz)
+    // The original (at another rate than the source's: through 16 kHz).
+    // Shared with the analysis and between publications, not copied.
+    std::shared_ptr<const Planar> dry;
     Planar wet;               // denoised; empty: not available (yet), the original plays
 };
 
@@ -134,8 +138,10 @@ public:
     std::shared_ptr<const SourceAudio> atRate(int rate) const;
 
     double sampleRate() const noexcept { return rate_; }
-    int channels() const noexcept { return int(input_.size()); }
-    std::int64_t length() const noexcept { return input_.empty() ? 0 : std::int64_t(input_[0].size()); }
+    int channels() const noexcept { return input_ ? int(input_->size()) : 0; }
+    std::int64_t length() const noexcept {
+        return input_ && !input_->empty() ? std::int64_t((*input_)[0].size()) : 0;
+    }
     bool hasInput() const noexcept { return hasInput_; }
     bool denoised() const noexcept { return !y16_.empty(); }
     // Why there is no wet audio (empty if denoised)
@@ -144,7 +150,7 @@ public:
 private:
     double rate_ = 0.0;
     bool hasInput_ = false;
-    Planar input_;  // at rate_
+    std::shared_ptr<const Planar> input_;  // at rate_ (also the stored audio's dry)
     Planar x16_;    // input at 16 kHz (empty if rate_ is unsupported)
     Planar y16_;    // denoised at 16 kHz (empty if not denoised)
     std::string message_;

@@ -19,6 +19,7 @@
 
 #include "denoiser/denoiser.h"
 #include "denoiser/offline.h"
+#include "denoiser/offline_rate.h"
 
 #include <cstdlib>
 #include <filesystem>
@@ -212,6 +213,8 @@ void checkErrors() {
         {path(mlp) + " " + path(in48) + " " + path(out), 1},             // not the model's rate, offline
         {"--stream " + path(mlp) + " " + path(in8) + " " + path(out), 1},  // below 16 kHz
         {"--stream " + path(centred) + " " + path(in) + " " + path(out), 1},
+        {"--resample " + path(mlp) + " " + path(in8) + " " + path(out), 1},  // below 16 kHz
+        {"--resample --stream " + path(mlp) + " " + path(in48) + " " + path(out), 2},
         {path(mlp) + " " + path(in) + " " + path(work / "no_such_dir" / "x.wav"), 1},
         {"--help", 0},
         {"--version", 0},
@@ -228,7 +231,22 @@ void checkErrors() {
         const wav::Audio a = wav::read(out);
         CHECK(a.sampleRate == 48000 && a.channels.size() == 2 && a.frames() == tone.size() && a.format == wav::Format::Pcm24);
     }
-    std::printf("error cases and --stream at 48 kHz: done\n");
+    // --resample at 48 kHz (the ARA path): denoiseClipAtRate, also for a centred model
+    for (const fs::path& model : {mlp, centred})
+        for (const char* band : {"drop", "pass"}) {
+            CHECK(denoise("-q --resample --float --high-band=" + std::string(band) + " " + path(model) + " " +
+                          path(in48) + " " + path(out)) == 0);
+            const wav::Audio a = wav::read(out);
+            CHECK(a.sampleRate == 48000 && a.channels.size() == 2 && a.frames() == tone.size());
+            const wav::Audio x = wav::read(in48);
+            const std::vector<unsigned char> bytes = wav::readFile(model);
+            const auto m = Model::fromMemory(bytes.data(), bytes.size());
+            auto net = m->makeNetwork();
+            const auto ref = denoiseClipAtRate(m->info(), *net, 48000, x.channels[0].data(), x.frames(),
+                                               std::string(band) == "pass" ? HighBand::PassThrough : HighBand::Drop);
+            CHECK(a.channels.size() == 2 && golden::relErr(a.channels[1].data(), ref.data(), ref.size()) <= kTol);
+        }
+    std::printf("error cases, --stream and --resample at 48 kHz: done\n");
 }
 
 }  // namespace

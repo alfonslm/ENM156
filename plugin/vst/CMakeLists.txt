@@ -22,7 +22,11 @@ juce_add_plugin(DenoiserPlugin
     # BUNDLE_ID: "org.enm156.denoiser.arafactory.<version>" and
     # "org.enm156.denoiser.aradocumentarchive.1" (bump the latter when the
     # stored document format changes)
-    IS_ARA_EFFECT ${DENOISER_ENABLE_ARA})
+    IS_ARA_EFFECT ${DENOISER_ENABLE_ARA}
+    # The plugin replaces samples one for one: no time-stretching or
+    # content-based fades, and no content (notes, tempo, ...) for the host to
+    # read (ARA_ANALYSIS_TYPES is left at JUCE's default, none)
+    ARA_TRANSFORMATION_FLAGS kARAPlaybackTransformationNoChanges)
 
 target_sources(DenoiserPlugin
     PRIVATE

@@ -162,7 +162,7 @@ public:
     void rebuildPlan();
 
     // Longest a non-realtime render waits per block for analysis that is still running
-    static constexpr double kMaxOfflineWaitSeconds = 120.0;
+    static constexpr double kMaxOfflineWaitSeconds = 300.0;
 
 private:
     void collectGarbage();

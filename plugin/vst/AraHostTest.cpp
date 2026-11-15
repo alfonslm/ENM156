@@ -889,11 +889,29 @@ void testAllocations(Host& host) {
 }
 #endif
 
+// Not a test: how long the analysis of a 48 kHz stereo source takes
+void bench(Host& host, const juce::String& modelPath, double seconds) {
+    auto doc = host.createDocument(2);
+    if (!doc)
+        return;
+    const auto n = size_t(48000.0 * seconds);
+    auto& src = doc->addSource(noise(2, n, 81), 48000, "bench");
+    doc->addRegion(src, 0.0, seconds, 0.0);
+    const auto start = std::chrono::steady_clock::now();
+    check(doc->restore(settingsArchive(modelPath)), "restore");
+    doc->render(48000, 0, 512, false);  // offline: returns when the analysis is done
+    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    std::printf("%s: %.0f s of 48 kHz stereo analysed in %.2f s (%.1fx real time); %s\n",
+                juce::File(modelPath).getFileName().toRawUTF8(), seconds, elapsed, seconds / elapsed,
+                sourceStatus(*doc->plugin).toRawUTF8());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 4) {
-        std::printf("usage: %s <plugin.vst3> <golden dir> <work dir>\n", argv[0]);
+    const bool benchMode = argc == 7 && juce::String(argv[4]) == "bench";
+    if (argc != 4 && !benchMode) {
+        std::printf("usage: %s <plugin.vst3> <golden dir> <work dir> [bench <model.bin> <seconds>]\n", argv[0]);
         return 2;
     }
     const auto cwd = juce::File::getCurrentWorkingDirectory();
@@ -921,6 +939,11 @@ int main(int argc, char** argv) {
     if (!host.description.hasARAExtension) {
         std::printf("FAIL: the plugin has no ARA factory\n");
         return 1;
+    }
+
+    if (benchMode) {
+        bench(host, cwd.getChildFile(juce::String::fromUTF8(argv[5])).getFullPathName(), std::atof(argv[6]));
+        return failures == 0 ? 0 : 1;
     }
 
     try {

@@ -72,16 +72,16 @@ std::shared_ptr<const denoiser::ResampleFilter> filterFor(double rate) {
 
 void SourceAnalysis::setInput(double sampleRate, Planar input) {
     rate_ = sampleRate;
-    input_ = std::move(input);
-    if (int(input_.size()) > kMaxSourceChannels)
-        input_.resize(size_t(kMaxSourceChannels));
+    if (int(input.size()) > kMaxSourceChannels)
+        input.resize(size_t(kMaxSourceChannels));
+    input_ = std::make_shared<const Planar>(std::move(input));
     hasInput_ = true;
     x16_.clear();
     y16_.clear();
     message_.clear();
     if (isSupportedRate(rate_)) {
         const auto filter = filterFor(rate_);
-        for (const auto& channel : input_)
+        for (const auto& channel : *input_)
             x16_.push_back(denoiser::clipToModelRate(*filter, channel.data(), channel.size()));
     }
 }
@@ -93,7 +93,7 @@ Outcome SourceAnalysis::denoise(const std::shared_ptr<const denoiser::Model>& mo
         message_ = "No model chosen: the original plays.";
         return Outcome::NoModel;
     }
-    if (length() == 0 || input_.empty()) {
+    if (length() == 0 || channels() == 0) {
         message_ = "Empty audio source.";
         return Outcome::Empty;
     }
@@ -147,12 +147,12 @@ std::shared_ptr<const SourceAudio> SourceAnalysis::atSourceRate(denoiser::HighBa
     audio->sampleRate = rate_;
     audio->channels = channels();
     audio->length = length();
-    audio->dry = input_;
+    audio->dry = input_ ? input_ : std::make_shared<const Planar>();
     if (!y16_.empty()) {
         const auto filter = filterFor(rate_);
         const bool passHigh = highBand == denoiser::HighBand::PassThrough && !filter->bypass();
-        for (std::size_t c = 0; c < input_.size(); ++c) {
-            const std::vector<float>& x = input_[c];
+        for (std::size_t c = 0; c < input_->size(); ++c) {
+            const std::vector<float>& x = (*input_)[c];
             std::vector<float> y = denoiser::clipFromModelRate(*filter, y16_[c].data(), y16_[c].size(), x.size());
             if (passHigh) {
                 const std::vector<float> round =
@@ -176,11 +176,13 @@ std::shared_ptr<const SourceAudio> SourceAnalysis::atRate(int rate) const {
     // The source's duration at the new rate
     const std::size_t n = std::size_t(std::llround(double(length()) * rate / rate_));
     audio->length = std::int64_t(n);
+    Planar dry;
     for (std::size_t c = 0; c < x16_.size(); ++c) {
-        audio->dry.push_back(denoiser::clipFromModelRate(*filter, x16_[c].data(), x16_[c].size(), n));
+        dry.push_back(denoiser::clipFromModelRate(*filter, x16_[c].data(), x16_[c].size(), n));
         if (!y16_.empty())
             audio->wet.push_back(denoiser::clipFromModelRate(*filter, y16_[c].data(), y16_[c].size(), n));
     }
+    audio->dry = std::make_shared<const Planar>(std::move(dry));
     return audio;
 }
 
@@ -200,7 +202,7 @@ RenderResult renderPlan(const RenderPlan& plan, std::int64_t position, int n, fl
             continue;
         const AudioSlot::Reader reader(*region.slot);
         const SourceAudio* audio = reader.get();
-        if (audio == nullptr || audio->channels < 1) {
+        if (audio == nullptr || audio->channels < 1 || !audio->dry || int(audio->dry->size()) < audio->channels) {
             ++result.regionsSilent;
             continue;
         }
@@ -224,8 +226,8 @@ RenderResult renderPlan(const RenderPlan& plan, std::int64_t position, int n, fl
             const std::size_t start = std::size_t(from + region.offset);
             if (srcChannels >= 2 && outChannels == 1) {
                 // Stereo source on a mono output: the mean of both channels
-                const float* d0 = audio->dry[0].data() + start;
-                const float* d1 = audio->dry[1].data() + start;
+                const float* d0 = (*audio->dry)[0].data() + start;
+                const float* d1 = (*audio->dry)[1].data() + start;
                 if (hasWet) {
                     const float* w0 = audio->wet[0].data() + start;
                     const float* w1 = audio->wet[1].data() + start;
@@ -241,7 +243,7 @@ RenderResult renderPlan(const RenderPlan& plan, std::int64_t position, int n, fl
             }
             // Mono source: on every output channel; stereo: channel by channel
             const std::size_t s = std::size_t(std::min(c, srcChannels - 1));
-            const float* d = audio->dry[s].data() + start;
+            const float* d = (*audio->dry)[s].data() + start;
             if (hasWet) {
                 const float* w = audio->wet[s].data() + start;
                 for (int i = 0; i < count; ++i)

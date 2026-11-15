@@ -109,7 +109,7 @@ void testAnalysis() {
             auto audio = a.atSourceRate(hb);
             check(audio->channels == 2 && audio->length == std::int64_t(n) && audio->sampleRate == k.rate,
                   "shape");
-            check(audio->dry == in, "dry != input");
+            check(audio->dry && *audio->dry == in, "dry != input");
             double worst = 0.0;
             for (std::size_t c = 0; c < 2; ++c) {
                 auto net = model->makeNetwork();
@@ -146,7 +146,8 @@ void testAnalysisEdges() {
     a.setInput(48000, Planar{signal(4800, 3)});
     check(a.denoise(nullptr, nullptr) == Outcome::NoModel && !a.message().empty(), "no model");
     auto audio = a.atSourceRate(denoiser::HighBand::Drop);
-    check(audio->wet.empty() && audio->dry.size() == 1, "no model: original only");
+    check(audio->wet.empty() && audio->dry->size() == 1, "no model: original only");
+    check(audio->dry == a.atSourceRate(denoiser::HighBand::PassThrough)->dry, "the original is shared, not copied");
 
     const std::size_t min16 = denoiser::minClipSamples(centred->info());
     a.setInput(48000, Planar{signal(3 * (min16 - 1), 4)});
@@ -181,16 +182,18 @@ std::shared_ptr<AudioSlot> slotWith(int channels, std::int64_t n, float dryBase,
     audio->sampleRate = 48000;
     audio->channels = channels;
     audio->length = n;
+    Planar dry;
     for (int c = 0; c < channels; ++c) {
         std::vector<float> d(static_cast<size_t>(n)), w(static_cast<size_t>(n));
         for (std::int64_t i = 0; i < n; ++i) {
             d[size_t(i)] = dryBase + float(c) * 1000.0f + float(i);  // sample index visible in the value
             w[size_t(i)] = wetBase + float(c) * 1000.0f + float(i);
         }
-        audio->dry.push_back(std::move(d));
+        dry.push_back(std::move(d));
         if (wet)
             audio->wet.push_back(std::move(w));
     }
+    audio->dry = std::make_shared<const Planar>(std::move(dry));
     auto slot = std::make_shared<AudioSlot>();
     slot->publish(audio);
     return slot;
@@ -323,11 +326,13 @@ void testSlotStress(double seconds) {
             audio->sampleRate = 48000;
             audio->channels = 2;
             audio->length = 512 + (version % 7) * 300;
+            Planar dry;
             for (int c = 0; c < 2; ++c) {
-                audio->dry.emplace_back(size_t(audio->length), float(version));
+                dry.emplace_back(size_t(audio->length), float(version));
                 if (version % 3 != 0)
                     audio->wet.emplace_back(size_t(audio->length), float(version));
             }
+            audio->dry = std::make_shared<const Planar>(std::move(dry));
             slot->publish(std::move(audio));
             ++version;
             ++published;
