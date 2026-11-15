@@ -637,10 +637,12 @@ only on Linux/glibc, the test hook through an environment variable set with
   and a source's samples change 8 times) and `plugin_ara_engine` with a 10 s
   `AudioSlot` stress (68 707 publications during 500 092 blocks on two
   rendering threads): **no reports**.
-- **Steinberg's VST3 validator** 3.8.0 on the Release build: **47 / 47 passed**.
-- **pluginval 1.0.4, strictness 10, including its GUI tests under Xvfb**:
-  **SUCCESS** (no model; these tools don't bind ARA, so they test the
-  real-time side and that ARA support didn't break it).
+- **Steinberg's VST3 validator** 3.8.0: **47 / 47 passed**, and
+  **pluginval 1.0.4 at strictness 10, including its GUI tests under Xvfb:
+  SUCCESS**, both on the Release build without a model and on a build with
+  `-DDENOISER_DEFAULT_MODEL=<config.toml-sized TCN>`. These tools don't
+  bind ARA: they check the real-time side and that the ARA additions didn't
+  break it.
 - **The ARA SDK's `ARATestHost`** (ARA_Examples of the pinned SDK 2.3.0,
   built in Debug against the VST3 SDK 3.8.0 with its ARA validation on;
   outside ctest, it needs the VST3 SDK and a separate build; GCC 13 needed
