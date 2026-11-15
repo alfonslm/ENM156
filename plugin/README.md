@@ -11,10 +11,16 @@ conflicts. Nothing outside it is changed.
 
 **Status:** the core runs MLP, SNN and TCN models end to end and matches Python
 (golden vectors and full-size models; see "Inference, the per-channel
-denoiser and the command-line tool" below), with host-rate resampling for
-the plugin and a working `denoise` command-line tool (milestone M1). The
-real-time processor in the VST3 and the ARA document controller come in
-later issues; the plugin itself is still a pass-through.
+denoiser and the command-line tool" below), with host-rate resampling and a
+working `denoise` command-line tool (milestone M1). The VST3 plugin runs the
+denoiser in real time (see "The VST3 effect" below): model file chosen in its
+window and saved in the session, mix, latency-compensated bypass, high-band
+switch, exact latency, no allocation or locks on the audio thread, tested
+headlessly through its VST3 interface and checked with Steinberg's validator
+and pluginval (strictness 10). It has **not** been tried in a DAW yet (there
+is none in the development environment; a checklist is below). The ARA
+document controller (offline, whole clips) comes in a later issue; bound to
+ARA the plugin still outputs silence.
 
 ## Decisions
 
@@ -117,7 +123,9 @@ build and `-C Release` to ctest, as the CI workflow does.
 | `DENOISER_BUILD_PLUGIN` | `OFF` | fetch JUCE + the ARA SDK and build the VST3 |
 | `DENOISER_ENABLE_ARA` | `ON` | build the plugin as an ARA 2 plugin |
 | `DENOISER_BUILD_CLI` | `ON` | the `denoise` command-line tool |
-| `DENOISER_BUILD_TESTS` | `ON` | the tests (and, with the plugin, the host test) |
+| `DENOISER_BUILD_TESTS` | `ON` | the tests (and, with the plugin, the plugin tests) |
+| `DENOISER_PROCESSOR_TEST_COUNT_ALLOCATIONS` | `ON` | plugin builds: count allocations in `denoiser_processor_test` (turn off for sanitizer builds) |
+| `DENOISER_DEFAULT_MODEL` | empty | plugin builds, **for validation only**: a model file every new instance loads, so that pluginval / Steinberg's validator (which can't restore a state) test the denoiser itself |
 
 Offline, or to share one checkout between build folders, point a dependency at
 a local clone of the same version: `-DFETCHCONTENT_SOURCE_DIR_JUCE=/path/to/JUCE`,
@@ -126,10 +134,10 @@ a local clone of the same version: `-DFETCHCONTENT_SOURCE_DIR_JUCE=/path/to/JUCE
 
 ### Checking the plugin
 
-- `ctest` in a plugin build runs `plugin_passthrough`: a small headless host
-  (`vst/HostTest.cpp`, JUCE's VST3 hosting) loads the built `.vst3`, checks
-  that it exposes an ARA factory, and that stereo and mono audio in blocks of
-  1 to 512 samples come out bit-identical.
+- `ctest` in a plugin build also runs `plugin_vst3` (a small headless host,
+  `vst/HostTest.cpp`, loads the built `.vst3` with JUCE's VST3 hosting and
+  checks the denoiser through it) and `plugin_processor_*` (the processor
+  class without a host); see "The VST3 effect", "Tests".
 - Steinberg's validator (from the VST3 SDK, MIT, tag `v3.8.0_build_66`) can be
   built with `-DSMTG_ENABLE_VST3_PLUGIN_EXAMPLES=OFF -DSMTG_ENABLE_VSTGUI_SUPPORT=OFF`
   and target `validator` (on Linux its hosting examples also need
@@ -139,6 +147,262 @@ a local clone of the same version: `-DFETCHCONTENT_SOURCE_DIR_JUCE=/path/to/JUCE
   Don't pass it `--vst3validator` with the 3.8 validator: pluginval hands it
   the `.so` inside the bundle, which that validator rejects ("is not a module
   directory").
+
+## The VST3 effect (real time)
+
+`vst/`: `PluginProcessor.*` (the JUCE `AudioProcessor`), `RealtimeEngine.*`
+(the processing state, no JUCE), `PluginEditor.*` (the UI). The plugin runs
+the denoiser live, like `denoiser/stream.py`, at the host's rate, mono or
+stereo (one independent denoiser per channel).
+
+### Loading a model
+
+Open the plugin's window and press **Load model...**, then pick a model file
+written by [`tools/export.py`](tools/README.md) (`model.bin`). The window shows:
+
+- the file's path, and one line describing the model (`Model::describe()`,
+  e.g. `mlp 130 -> 1024 -> 1024 -> 65, magnitude; n_fft 128, hop 80, long window 1280; 16000 Hz; real-time`);
+- the latency in samples and ms at the host's rate;
+- in orange, why audio passes through, if it does.
+
+**Unload** goes back to no model. Loading reads and builds the model on the
+thread that asks (the UI thread): 6–8 ms for a config.toml-sized MLP, 1–3 ms
+for an SNN, 35–47 ms for a TCN (measured, see "CPU" below). The audio thread
+never waits for it.
+
+Audio passes through unchanged (delayed by the latency, see below) and the
+window says why when:
+
+| situation | message (shortened) |
+|---|---|
+| no model chosen | "No model loaded: audio passes through ..." |
+| the file is missing (e.g. a session from another computer) | "Model file not found: <path>. ... choose the file again." |
+| the file is not a valid model file | "Could not load <name>: <reason>." |
+| the model uses centred frames (`realtime: false`) | "... can't run in real time; audio passes through. It can be used in ARA mode." |
+| the host rate is unsupported (below 16 kHz, or e.g. 47999 Hz) | "The host sample rate (... Hz) is not supported ..." (latency 0) |
+
+The path is remembered (and saved) even when loading fails, so that a
+session opened where the file does exist works.
+
+### Parameters (automatable, in the host's parameter list)
+
+| parameter | values | |
+|---|---|---|
+| **Mix** | 0–100 % (default 100) | dry/wet. The dry signal is the input delayed by exactly the reported latency, so the two are aligned. 0 % gives the delayed input bit for bit; 100 % the denoiser's output bit for bit. 20 ms linear ramps. |
+| **Bypass** | off / on | Also the host's own bypass (`getBypassParameter()`). Latency-compensated: bypassed, the output is the input delayed by the same latency, bit for bit, so toggling it doesn't shift the audio. The denoiser keeps running while bypassed (constant CPU, no restart transient when it is switched back on). 20 ms ramp. |
+| **High band** | Drop / Pass through | What happens above 8 kHz, which the model never sees (see "Host sample rate, the band above 8 kHz" below). **Drop** (default): the 16 kHz result only, nothing above ~7.5 kHz. **Pass through**: the band the 16 kHz round trip removes is added back from the delayed input (noise there stays). No effect at a 16 kHz host rate. 20 ms ramp. |
+
+The high band is a smooth parameter, not a re-prepare: each engine runs a
+second resampling round trip with no model (the core's own pass-through
+processor) and adds `dry − that` scaled by the parameter. That is exactly
+option B of the core (`HighBand::PassThrough`, input delayed by the latency
+minus its unprocessed round trip) computed outside the adapter; the plugin
+matches the core's `HighBand::PassThrough` to 3e-8 (`plugin_processor_core`).
+It costs one more resampler pair per channel, ~0.3 % of a core at 48 kHz
+stereo, also while the high band is dropped.
+
+### Latency
+
+The plugin reports `hostLatencySamples(hostRate, hop, n_fft − hop)` (see
+"Latency" in the host-rate section): 669 samples at 48 kHz, 614 at 44.1 kHz,
+1338 at 96 kHz, 127 at 16 kHz for config.toml's STFT (n_fft 128, hop 80),
+13.9 ms (7.9 ms at 16 kHz).
+
+| state | latency reported |
+|---|---|
+| a model runs | that formula for the model's hop and n_fft |
+| no model, a missing / broken / offline-only model | the same formula for the **last shape that ran**: config.toml's (n_fft 128, hop 80) in a new instance, else the hop / n_fft of the last model that ran in this instance, also saved in the state. Audio is the input delayed by that latency. So loading a model of that shape (the usual case) doesn't change the host's compensation, and a session whose model file is missing keeps the latency it was mixed with. |
+| a model with a different hop / n_fft is loaded | changes; the host is told by the loading thread (`setLatencySamples`, which JUCE's VST3 wrapper turns into `restartComponent(kLatencyChanged)` on the message thread) when the new engine is handed to the audio thread |
+| the host rate changes | `prepareToPlay` rebuilds everything and reports it |
+| unsupported host rate | 0, audio copied unchanged |
+| bound to an ARA document | 0 (ARA playback is aligned; JUCE's wrapper requires 0) |
+
+### What happens at a model change (swap)
+
+A model is loaded and a complete processing state (`Engine`: the model, one
+`ChannelDenoiser` per channel, the `HostRateAdapter`, the dry delay line and
+scratch buffers, for the current rate and channel count) is built on the
+loading thread and handed to the audio thread through one atomic pointer.
+At the start of its next block the audio thread takes it and:
+
+- keeps the **old engine running and audible** until the new one has been fed
+  for its latency plus its widest analysis window (so its output depends only
+  on real input: 669 + 3840 samples at 48 kHz for config.toml's long window),
+- then **crossfades linearly over 10 ms** to the new one,
+- then retires the old one to a slot that a control thread frees (the next
+  control call or a 10 Hz timer).
+
+So there is no gap or click, CPU doubles for ~100 ms, and from the end of the
+crossfade the output is exactly that of a fresh instance of the new model
+started at the swap (`plugin_processor_core` checks this to 7e-9 and that the
+crossfade is no steeper than the signals themselves). A TCN or SNN still
+settles over its own context after that (a TCN looks back 127 frames, 0.64
+s), as after any reset. `prepareToPlay` and the host's `reset()` start
+from silence instead (a full reset of every state).
+
+### State, and moving sessions between computers
+
+The plugin's state (XML) holds the model file's **absolute path**, the
+hop / n_fft of the last model that ran, the three parameters, and, for
+information only, what the instance was doing (description, message,
+latency). Restoring it loads the file again.
+
+The model is **referenced, not embedded**. A session moved to another computer
+finds its model only if the file exists at the same absolute path there;
+otherwise the plugin passes audio through with the latency it had, and the
+window says "Model file not found: <path>". Choose the file again (or copy it
+to that path) and save. To move sessions, keep models at the same path on
+every machine (e.g. a folder synced to the same place), or re-pick them.
+
+Embedding the model in the state would make sessions self-contained, but every
+instance would carry the whole file in the session and in every undo /
+snapshot the host keeps: ~5 MB for config.toml's MLP (5.8 MB complex_mask),
+~6.5 MB for its TCN, 0.7–1.5 MB for its SNN, per instance (as base64 in some
+hosts' project files, +33 %). Ten instances of the MLP make a 50 MB project.
+That is why it is not done; an option "embed the model in the session" could
+be added later (the state format has a `version` attribute for that).
+
+### Threads and real-time safety (also: hooks for ARA)
+
+- **Control threads** (message thread, a host's state thread, the editor):
+  `loadModelFile`, `clearModel`, `setStateInformation`, `prepareToPlay`,
+  `releaseResources`. They are serialised by one mutex the audio thread never
+  touches, read files, parse, allocate, build engines, report the latency,
+  free retired engines.
+- **Audio thread** (`processBlock`): takes a pending engine (atomic exchange),
+  crossfades, retires the old one (atomic compare-exchange into one of 8
+  slots; if all are full, it tries again next block). No allocation, free,
+  lock, file access, logging or exception. Denormals flushed
+  (`ScopedNoDenormals`). Host blocks of any size are split into chunks of 256,
+  so nothing depends on the block size. The host's `reset()` sets a flag the
+  audio thread acts on at its next block.
+- The only lock on the audio path is the one JUCE's VST3 wrapper takes around
+  `processBlock` (`getCallbackLock()`); `prepareToPlay` / `releaseResources`
+  take it too, to replace the engine directly.
+- For the ARA path: `getModel()` returns the loaded model (also an
+  offline-only, centred one that the real-time path refuses) as an
+  immutable `shared_ptr<const denoiser::Model>`; `getStatus()` its path,
+  description and message; `getMix()`, `getBypass()`, `getHighBand()` and
+  `parameters()` the settings. The processor is a `juce::ChangeBroadcaster`
+  that sends a change message (on the message thread) whenever the model or
+  the status changes. `processBlockForARA` still comes first in `processBlock`.
+
+### Tests (ctest, in a plugin build; all headless, ~10 s in Release)
+
+| test | what |
+|---|---|
+| `plugin_vst3` | `vst/HostTest.cpp`: JUCE's VST3 hosting loads the built `.vst3` (as a DAW would) and sets models and parameters through the plugin's state. Checks: an ARA factory is exposed; no model: latency 669 at 48 kHz and output = input delayed by it, bit for bit, mono and stereo, blocks 1–512; latency = `hostLatencySamples` at 16, 44.1, 48 and 96 kHz for two model shapes; at 16 kHz the output of an MLP, an SNN and a TCN golden model equals the core's `denoiseClip` shifted by the latency (golden input and a 1 s clip, 2 channels; tolerance 1e-5, measured 0); blocks of 16, 17, 64, 256, 333, 1024, 4096, random 1–4096 and a pattern give the same output (1e-5, measured 0); bypass and mix 0 give the input delayed by the latency bit for bit, also through the host's bypass parameter; mix 0.5 = mean of wet and dry (1e-5, measured 0); state saved, a new instance restored from it gives the same output; a missing file, a broken file and a centred model pass audio through with the right latency and message; 8 kHz passes through with latency 0. On Linux it also counts heap allocations and frees through the whole VST3 processing call (JUCE's hosting side, JUCE's wrapper and the processor; the counting `malloc` / `operator new` of the test program are the ones the plugin calls): 0 in steady state, 0 across a model swap made by a state restore, 0 when processing a parameter change. |
+| `plugin_processor_alloc` | `vst/ProcessorTest.cpp` compiles the processor sources into a program (no host, ARA off) and counts allocations on the audio thread over 1300 blocks of 0–512 samples at 48, 44.1 and 16 kHz stereo, with parameter changes and a reset, across swaps prepared beforehand to a TCN, a model of another shape, no model, a centred model and an SNN: 0. (Only the audio thread is counted: JUCE's timer thread allocates while posting messages nobody dispatches in a test.) |
+| `plugin_processor_core` | the plugin against the core's `HostRateAdapter` with `HighBand::Drop` (0 difference) and `PassThrough` (3e-8) at 48 and 44.1 kHz; status messages; what a swap does (above) |
+| `plugin_processor_stress` | 2 s of audio in random blocks on one thread while another loads models (6 kinds incl. missing and centred), unloads, saves / restores state, changes parameters and resets, and a third reads the status. Run under ThreadSanitizer: see below. |
+
+Also run here (not in CI): all 19 tests under **AddressSanitizer + UBSan**
+(Debug, GCC 13; this found a test bug, now fixed), the stress test for 10 s
+under **ThreadSanitizer** (GCC 13, RelWithDebInfo, JUCE built with TSan too:
+1210 model loads during 5877 audio blocks, **no reports**), **Steinberg's
+validator** (3.8.0) **47/47 passed** and **pluginval 1.0.4 at strictness 10
+SUCCESS**, both with no model and with a model loaded (a build with
+`-DDENOISER_DEFAULT_MODEL=<config.toml-sized TCN>`, see Options), pluginval
+including its GUI tests (editor open while processing, editor automation)
+under Xvfb.
+
+To run the sanitizer builds yourself:
+
+```bash
+cmake -S plugin -B plugin/build-tsan -G Ninja -DDENOISER_BUILD_PLUGIN=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DCMAKE_C_FLAGS=-fsanitize=thread -DCMAKE_CXX_FLAGS=-fsanitize=thread \
+  -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread -DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=thread \
+  -DDENOISER_PROCESSOR_TEST_COUNT_ALLOCATIONS=OFF
+cmake --build plugin/build-tsan --target denoiser_processor_test
+plugin/build-tsan/vst/denoiser_processor_test_artefacts/RelWithDebInfo/denoiser_processor_test stress plugin/tests/golden 10
+```
+
+(ASan + UBSan the same way with `-fsanitize=address,undefined`, then `ctest`.)
+
+### CPU (48 kHz stereo, blocks of 512)
+
+`denoiser_processor_test bench <model.bin>...` times `processBlock` over 10 s
+of audio (best of 3). Release, GCC 13, Intel Xeon @ 2.3 GHz shared VM, one
+thread; untrained models at config.toml's sizes made by `tools/check_cli.py
+--out`; ranges over 3 runs (this machine is noisy):
+
+| model | % of one core | slowest 512-sample block, % of its 10.7 ms |
+|---|---|---|
+| no model (pass-through) | 0.01 % | 0 % |
+| MLP 130 → 1024 → 1024 → 65, magnitude | **8.5–12.9 %** | 14–26 % |
+| MLP 260 → 1024 → 1024 → 130, complex_mask | 10–16 % | 18–61 % |
+| SNN 260 → 256 × 3 → 130, complex_mask (2 % spikes) | **1.6–1.7 %** | 2–11 % |
+| SNN, threshold 0.1 (40 % spikes) / recurrent (45 %) | 2.0–2.2 % | 3–7 % |
+| TCN 256 channels, dilations 1–32, magnitude | **7.3–12 %** | 13–34 % |
+| TCN, complex_mask | 7.8–13 % | 12–44 % |
+
+The high-band setting makes no measurable difference. The cost is the
+network's (see "Speed" above): per channel 200 frames/s, each with ~1.3 M
+(MLP) or ~1.6 M (TCN) multiply-adds. The slowest block is what matters for
+drop-outs: a block of 512 at 48 kHz carries 2–3 hops per channel, and the
+worst seen (61 %, once) is the shared VM; on a desktop expect the averages
+above or less. During a model swap both models run for ~100 ms.
+
+### Limitations
+
+- Mono and stereo only (input layout = output layout). Each channel is
+  denoised independently, which can shift the stereo image.
+- Host rates below 16 kHz or with a ratio needing more than 1000 resampler
+  phases pass through (latency 0).
+- The model is referenced by path (above). The file chooser shows `*.bin`.
+- Loading blocks the UI thread for the load time (up to ~50 ms for a
+  config.toml-sized TCN).
+- No smoothing of a model's own start-up: a TCN or SNN settles over its
+  context after a reset or a swap.
+- No preset / program support; one program ("Default").
+- AU and standalone are not built.
+- `DENOISER_DEFAULT_MODEL` is for validation builds only; normal builds start
+  without a model.
+
+### Not verified: running in a DAW
+
+There is no DAW in the development environment, so **"loads and runs in at
+least two VST3 hosts" has not been checked**. Everything above ran through
+JUCE's VST3 hosting code, Steinberg's validator and pluginval, which are not
+DAWs. To finish that item, in REAPER (and then one of Cubase / Studio One /
+Bitwig):
+
+1. Build Release, copy `ENM156 Denoiser.vst3` to the VST3 folder (see
+   "The VST3 plugin" above), rescan. It should appear as an effect (category
+   Fx / Restoration) by ENM156.
+2. Put it on a mono and on a stereo track with speech. Without a model: the
+   window says "No model loaded", the audio sounds unchanged, and REAPER's
+   performance meter / FX window shows a PDC of 669 samples at 48 kHz (614 at
+   44.1 kHz).
+3. **Load model...** → your exported `model.bin`. The description line
+   appears, the orange message disappears, the latency stays the same (for
+   an n_fft 128 / hop 80 model). Listen: noise reduced, nothing above ~7.5
+   kHz with High band = Drop; with Pass through the top end comes back
+   (with its noise).
+4. Toggle Bypass (the plugin's and REAPER's own bypass button) and sweep Mix
+   during playback: no clicks, no timing shift (compare with a duplicate dry
+   track: with Mix 0 they must null completely, see 6).
+5. Change the block size (REAPER: Preferences → Audio → Device, e.g. 64,
+   512, 2048) and the sample rate (44.1 / 48 / 96 kHz): it keeps working, the
+   reported latency follows the table above.
+6. **Null test against the command-line tool** (the issue's "null test"):
+   make a 16 kHz mono WAV, run `denoise --stream model.bin in.wav cli.wav`
+   (or plain `denoise model.bin in.wav cli.wav`: the same samples, see "16 kHz
+   host path = CLI"), set the project to 16 kHz, render the track with the
+   plugin to a 32-bit float WAV (Mix 100 %; REAPER removes the reported
+   latency when rendering), import both, invert the polarity of one and sum:
+   the residue should be silence (below −100 dB; `plugin_vst3` measures 0
+   for the same comparison through JUCE's VST3 hosting). At 48 kHz compare
+   with `denoise --stream` on a 48 kHz file the same way. If the render is
+   shifted by exactly the reported latency, the host did not compensate it.
+7. Save the project, close, reopen: the model comes back. Rename the model
+   file and reopen: audio passes through, the window says "Model file not
+   found", the latency is unchanged. Put the file back, reload it.
+8. Load a model while playing (and change models repeatedly): no drop-out
+   or click, at most a short crossfade.
+9. Hosts that bind the plugin through ARA (e.g. as an item / take effect in
+   REAPER, or as an ARA extension in Studio One / Cubase) get the ARA path,
+   which is the next issue: bound to ARA it currently outputs silence.
 
 ## Layout
 
@@ -159,9 +423,12 @@ plugin/
     golden/             golden test vectors written by tools/ (see tools/README.md)
   tools/                Python: checkpoint export and golden vectors (see tools/README.md)
   vst/                  DenoiserPlugin: JUCE AudioProcessor, VST3 + ARA
-    PluginProcessor.*   the processor (pass-through for now)
+    PluginProcessor.*   the processor: parameters, state, model loading, engine hand-over
+    RealtimeEngine.*    one prepared processing state (model, denoisers, adapter, mix); no JUCE
+    PluginEditor.*      the plugin's window
     DocumentController.cpp   the ARA entry point (createARAFactory), empty for now
-    HostTest.cpp        headless host for the plugin_passthrough test
+    HostTest.cpp        headless VST3 host: the plugin_vst3 test
+    ProcessorTest.cpp   the processor without a host: plugin_processor_* tests, CPU benchmark
 ```
 
 ## Working on it
