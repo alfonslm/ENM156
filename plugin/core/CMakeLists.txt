@@ -26,3 +26,6 @@ target_sources(denoiser_core PRIVATE src/tcn.cpp)
 
 # MLP and SNN inference, the shared Model and the per-channel denoiser (issue #6)
 target_sources(denoiser_core PRIVATE src/networks.cpp src/denoiser.cpp)
+
+# Whole clips at other sample rates, for the ARA analysis (issue #10)
+target_sources(denoiser_core PRIVATE src/offline_rate.cpp)
