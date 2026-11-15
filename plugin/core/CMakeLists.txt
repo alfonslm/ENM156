@@ -17,3 +17,6 @@ if(MSVC)
 else()
     target_compile_options(denoiser_core PRIVATE -Wall -Wextra -Wpedantic)
 endif()
+
+# Model/vectors file reader and the STFT front/back end (issue #5)
+target_sources(denoiser_core PRIVATE src/json.cpp src/tensor_file.cpp src/model_file.cpp src/features.cpp src/stream.cpp src/offline.cpp)
