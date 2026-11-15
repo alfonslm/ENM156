@@ -182,3 +182,100 @@ scratch memory, so use one per thread. `tests/test_fft.cpp` checks sizes 1280,
 128, 160 and 2 against a direct DFT in double precision (max abs error 8e-6
 for 1280 on random input in [-1, 1]; the test allows 1e-3) and the round trip
 inverse(forward(x)) (max abs error 3e-7; the test allows 1e-5).
+
+## Host sample rate, the band above 8 kHz, and stereo
+
+The model runs at 16 kHz mono; hosts run at 44.1–192 kHz, mostly stereo.
+`core/include/denoiser/host_rate.h` (`HostRateAdapter`) wraps the 16 kHz
+hop-by-hop processor for the plugin; `core/include/denoiser/resample.h` has
+the resampler it is built on. Tests: `tests/test_resample.cpp`,
+`tests/test_host_rate.cpp`.
+
+### Decisions
+
+| | choice | trade-off |
+|---|---|---|
+| Band above 8 kHz | **A: output only the 16 kHz result**, resampled back (`HighBand::Drop`, the default). Nothing above ~7.5 kHz comes out. | Simplest, and what the model was trained for, but speech sounds duller than the dry signal. The UI should say so. |
+| | **B is implemented too**, behind `HighBand::PassThrough`: the band the model can't see passes through, delayed to match. | Full bandwidth, but noise above 8 kHz stays. +50% adapter cost (one more upsampler per channel). It is built as *input delayed by the latency − the input's own unprocessed round trip*, so with a pass-through model the output is exactly the delayed input (bit for bit), and the crossover (7–8 kHz) is complementary by construction. |
+| | C (scale the high band by the model's top bins) and D (train at 48 kHz) are not done; D belongs upstream. | |
+| Channels | **One independent 16 kHz processor per channel** (`setProcessor(channel, ...)`). | CPU × channels. Independent masks can shift the stereo image; mid/side or a shared mask are possible later. |
+| Host rates | **Integers from 16 to 384 kHz whose ratio to 16 kHz needs at most 1000 phases**: 22.05, 24, 32, 44.1, 48, 88.2, 96, 176.4, 192, 352.8, 384 kHz (`isSupportedHostRate`). At **16 kHz the resamplers are bypassed** (samples copied, bit-exact). | **Below 16 kHz (8, 11.025 kHz…) is refused**: the model needs the band up to 8 kHz. Odd rates such as 47999 Hz are refused because their table would be millions of taps. `prepare()` throws `std::invalid_argument`; the plugin should then pass audio through and say why. |
+| Resampler | **Hand-written polyphase Kaiser-windowed sinc**, linear phase, one prototype per rate on the grid `F = lcm` of the two rates (48 kHz: ÷3; 44.1 kHz: ×160 ÷441). No dependency. | Linear phase costs latency (≈ 3 ms each way); a minimum-phase filter would roughly halve that but would make option B's split inexact. |
+| Latency | One function, `hostLatencySamples(hostRate, hop, processorDelay)`. Exact and constant, independent of block sizes. | The adapter runs sample by sample on a fixed schedule, which is what makes it exact; at 0.3 % of a core that costs nothing worth saving. |
+
+### Filter (same at every rate)
+
+- Passband 0–7 kHz, stopband from 8 kHz, cutoff 7.5 kHz. Nothing aliases into
+  or images out of the band below 7 kHz; 7–8 kHz is the transition band
+  (−6 dB per pass at 7.5 kHz, so −12 dB for the round trip).
+- Length `2 · M · 48 + 1` taps on the grid, i.e. exactly **48 samples at
+  16 kHz (3 ms) of delay in each direction** (`kResampleHalfLength`); Kaiser
+  β from its estimate for that length (≈ 94 dB).
+- Measured from the prototype (zero-padded FFT, `test_resample`):
+  passband ripple **±0.00018 dB**, stopband attenuation **≥ 94.0 dB** (94.0–94.3
+  depending on the rate); polyphase phases' DC gain within 2e-6 of 1.
+- Taps per output: 48 kHz down 289 (per 16 kHz sample), up 97 (per 48 kHz
+  sample); 44.1 kHz down 265 × 160 phases, up 97 × 441 phases (one shared
+  42 337-tap table, 170 kB per direction, shared by all channels).
+
+### Latency
+
+`hostLatencySamples` = `floor((2·48 + processorDelay + hop − 1) · hostRate / 16000)`
+host samples, or `processorDelay + hop − 1` at 16 kHz:
+
+- 2 · 48: the two resamplers;
+- `processorDelay`: the 16 kHz processor's own delay (`n_fft − hop` for the
+  streaming denoiser, i.e. 48);
+- `hop − 1`: regrouping into hops. Each 16 kHz output sample leaves as soon as
+  the 16 kHz input sample with the same index has arrived; that needs `hop − 1`
+  samples of slack, not `hop`.
+- The fraction that `floor` drops is absorbed by sampling the upsampler up
+  to one host sample late (on the fine grid), so the number is exact.
+
+With the default model (`n_fft` 128, `hop` 80):
+
+| host rate | latency (samples) | ms |
+|---|---|---|
+| 16 kHz (bypass) | 127 | 7.94 |
+| 22.05 kHz | 307 | 13.92 |
+| 32 kHz | 446 | 13.94 |
+| 44.1 kHz | 614 | 13.92 |
+| 48 kHz | 669 | 13.94 |
+| 88.2 kHz | 1229 | 13.93 |
+| 96 kHz | 1338 | 13.94 |
+| 176.4 kHz | 2458 | 13.93 |
+| 192 kHz | 2676 | 13.94 |
+
+`denoiser/stream.py` calls its latency `n_fft` (128) because it counts a whole
+hop of buffering; sample by sample it is `n_fft − 1`, which is what the plugin
+reports at 16 kHz.
+
+### Measured (`test_host_rate`, Release, Intel Xeon @ 2.3 GHz)
+
+- Impulses at several positions and a broadband signal (40 sines up to 6 kHz),
+  pass-through stand-ins (identity with delay 48 and the built-in null
+  processor; also hop 160 / delay 96, hop 64 / delay 0, hop 1 / delay 3), at
+  every supported rate from 16 to 192 kHz, for blocks of 1, 7, 64, 80, 333
+  (in place), 512, 4096 and random sizes 0–700: peaks land exactly at the
+  reported latency, the broadband output matches the input delayed by it to
+  **−100 to −105 dB** (compared one sample off: −7 to −20 dB when resampling), and the output is
+  bit-identical for every block pattern.
+- Round trip with a pass-through model, option A, error relative to the
+  delayed input, per sine: 48 kHz **≤ −98.6 dB up to 6.5 kHz, −87.8 dB at
+  7 kHz**; 44.1 kHz ≤ −99.3 dB up to 6.5 kHz, −87.8 dB at 7 kHz (the test
+  allows −80 dB below 7 kHz). Level at 7.5 kHz −12.0 dB; at 8 kHz and above
+  **≤ −106 dB** (−106.6 dB at 8.5 kHz is the worst; the test requires
+  ≤ −85 dB).
+- Option B with a pass-through model: exactly the delayed input (error 0). With
+  a model that outputs silence: below 7 kHz ≤ −87.8 dB, 8 kHz and above passes
+  at 0.00 dB, matching the delayed input to ≤ −115 dB.
+- 16 kHz: output is the hop-by-hop result of the same processor delayed by
+  `hop − 1`, bit for bit.
+- `reset()` reproduces the first run bit for bit; no heap allocation in
+  `process`, `processChannel`, `reset`, `setProcessor` or
+  `processClipAligned` (counted by replacing `operator new`); stereo channels
+  equal their separate mono runs.
+- Cost of the adapter alone, 48 kHz stereo, blocks of 512: **3.2 ms per
+  second of audio** (0.3 % of one core) for option A, 4.8 ms for B; 44.1 kHz
+  about the same.
+- The tests also pass under AddressSanitizer + UBSan (Debug).
