@@ -15,7 +15,16 @@
 #include <juce_events/juce_events.h>
 
 #if DENOISER_COUNT_ALLOCATIONS
+// JUCE's warning flags include -Wmissing-prototypes, and Clang's <new>
+// doesn't declare every replaceable operator delete
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+#endif
 #include "../tests/alloc_hooks.h"
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 #endif
 
 #include <algorithm>
@@ -23,6 +32,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <iterator>
 #include <memory>
 #include <thread>
 #include <vector>

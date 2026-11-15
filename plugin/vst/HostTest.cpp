@@ -42,7 +42,16 @@
 #endif
 #endif
 #if DENOISER_COUNT_WRAPPER_ALLOCATIONS
+// JUCE's warning flags include -Wmissing-prototypes, and Clang's <new>
+// doesn't declare every replaceable operator delete
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+#endif
 #include "../tests/alloc_hooks.h"
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 #endif
 
 namespace {
