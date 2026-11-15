@@ -49,11 +49,22 @@ def evaluate_loss(model, waves, cfg, device):
     return total / int(waves.frames.sum())
 
 
+def check_no_filterbank(cfg, where=""):
+    """train.py's inputs and MSE targets are STFT frames (segment_frames),
+    which don't fit a network made for a learned filterbank's latent: it
+    would fail on a shape mismatch in the first batch, after loading the
+    audio. Filterbank models are trained with train_pesq.py (config.toml)."""
+    if cfg["model"]["filterbank"]:
+        raise SystemExit(f"model.filterbank is set{where} ({cfg['model']['filterbank']}), but train.py "
+                         "trains on STFT frames only: train a filterbank model with train_pesq.py")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     add_config_args(ap)
     cfg = load_config(ap.parse_args().set)
+    check_no_filterbank(cfg)
     tr = cfg["train"]
     out_dir = resolve_path(tr["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -62,6 +73,7 @@ def main():
     device, audio_device = get_device(cfg), get_device(cfg, "audio_device")
     print(f"Using device: {describe_device(device)}, training audio on {audio_device}")
     model, cfg = initial_model(cfg, device, tr["init_from"])  # before loading: it can set the stft
+    check_no_filterbank(cfg, f" in {tr['init_from']}")  # a checkpoint's settings replace the configured ones
     print_config(cfg, ("stft", "model", "train"))
     print(describe_model(cfg))
 

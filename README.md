@@ -40,6 +40,7 @@ training audio doesn't fit in your VRAM.
 .venv/bin/python tests/test_snn_stats.py                    # operation counts against counts by hand
 .venv/bin/python tests/test_evaluate_modes.py               # evaluate.py: saved samples vs --model
 .venv/bin/python tests/test_config.py                       # misspelt settings are refused
+.venv/bin/python tests/test_filterbank_model.py             # a denoiser on a learned filterbank
 ```
 
 Each checkpoint stores the `stft` and `model` settings it was trained with,
