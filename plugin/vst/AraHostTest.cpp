@@ -432,6 +432,12 @@ struct Host {
     juce::VST3PluginFormatHeadless format;
     juce::PluginDescription description;
     juce::ARAFactoryWrapper factory;
+    // An instance that is never bound, alive for the whole test: it keeps the
+    // plugin's module loaded. Otherwise destroying a document's last instance
+    // can unload the module (JUCE's VST3 hosting releases it with its last
+    // instance) while the document's ARA objects, which call into it, are
+    // still to be destroyed. A DAW keeps the module loaded the same way.
+    std::unique_ptr<juce::AudioPluginInstance> keepLoaded;
 
     std::unique_ptr<juce::AudioPluginInstance> createPlugin(int channels) {
         juce::String error;
@@ -450,6 +456,8 @@ struct Host {
     }
 
     std::unique_ptr<Document> createDocument(int channels = 2) {
+        if (!keepLoaded)
+            keepLoaded = createPlugin(2);
         auto doc = std::make_unique<Document>();
         doc->channels = channels;
         doc->plugin = createPlugin(channels);
@@ -943,6 +951,8 @@ int main(int argc, char** argv) {
 
     if (benchMode) {
         bench(host, cwd.getChildFile(juce::String::fromUTF8(argv[5])).getFullPathName(), std::atof(argv[6]));
+        host.factory = {};  // releases the plugin's ARA factory while the module is loaded
+        host.keepLoaded.reset();
         return failures == 0 ? 0 : 1;
     }
 
@@ -966,6 +976,8 @@ int main(int argc, char** argv) {
         fail(juce::String("exception: ") + e.what());
     }
 
+    host.factory = {};  // releases the plugin's ARA factory while the module is loaded
+    host.keepLoaded.reset();
     std::printf(failures == 0 ? "all checks passed\n" : "%d check(s) failed\n", failures);
     return failures == 0 ? 0 : 1;
 }
