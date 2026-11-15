@@ -10,7 +10,7 @@ run live (`denoiser/stream.py`) with a latency of one short window.
 
 ```bash
 python3 -m venv --system-site-packages .venv
-.venv/bin/pip install torch-pesq   # only needed for train_pesq.py
+.venv/bin/pip install -r requirements.txt   # what isn't in the system site-packages yet
 cp config.local.example.toml config.local.toml
 ```
 
@@ -38,6 +38,9 @@ training audio doesn't fit in your VRAM.
 .venv/bin/python tests/test_snn_neurons.py                  # spiking neurons on hand-made inputs
 .venv/bin/python tests/test_snn_stream.py                   # spiking network: live == offline == frame by frame
 .venv/bin/python tests/test_snn_stats.py                    # operation counts against counts by hand
+.venv/bin/python tests/test_evaluate_modes.py               # evaluate.py: saved samples vs --model
+.venv/bin/python tests/test_config.py                       # misspelt settings are refused
+.venv/bin/python tests/test_filterbank_model.py             # a denoiser on a learned filterbank
 ```
 
 Each checkpoint stores the `stft` and `model` settings it was trained with,

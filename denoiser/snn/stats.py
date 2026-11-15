@@ -14,6 +14,7 @@ comparing networks, not a measurement of any hardware.
 """
 import torch.nn as nn
 
+from ..pipeline import hop  # pipeline imports nothing of snn/, so no import cycle
 from .nets import SpikingModel
 
 PJ_PER_MAC = 4.6
@@ -71,8 +72,10 @@ class CostMeter:
 
 
 def describe_cost(cost, cfg):
-    """One printable line: operations and estimated power when run live."""
-    fps = cfg["data"]["sample_rate"] / cfg["stft"]["hop"]
+    """One printable line: operations and estimated power when run live.
+    Frames per second come from the hop the model runs at: the STFT's, or
+    a learned filterbank's stride when model.filterbank is set."""
+    fps = cfg["data"]["sample_rate"] / hop(cfg)
     text = f"{cost['macs'] * fps / 1e6:.1f} M MACs/s"
     if cost["rates"]:
         rates = ", ".join(f"{r:.3f}" for r in cost["rates"])

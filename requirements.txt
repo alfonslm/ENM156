@@ -1,0 +1,23 @@
+# What the Python project imports (Python 3.11 or newer: settings are read
+# with tomllib). No versions are pinned: none is known to be required.
+#   .venv/bin/pip install -r requirements.txt
+
+# everything
+torch
+numpy
+soundfile        # reading and writing audio (denoiser/data.py, saved samples)
+pyarrow          # the parquet files of the dataset (denoiser/data.py)
+
+# evaluate.py
+pesq
+pystoi
+
+# train_pesq.py
+torch-pesq       # the differentiable PESQ loss (denoiser/pesq_loss.py)
+torchaudio       # the impulse responses of its filters (denoiser/pesq_loss.py)
+
+# denoiser/make_mixtures.py
+scipy            # resampling to 16 kHz
+
+# optional: only train_pesq.py with pesq.stoi_weight > 0 imports it
+# torch-stoi
