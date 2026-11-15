@@ -3,7 +3,8 @@
 # (golden/ holds test vectors written by the Python export script.)
 set(DENOISER_TESTS
     core
-    fft)
+    fft
+    resample host_rate)
 
 foreach(name IN LISTS DENOISER_TESTS)
     add_executable(test_${name} test_${name}.cpp)

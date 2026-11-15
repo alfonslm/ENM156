@@ -2,7 +2,8 @@
 # Add new sources to the list below; public headers go in include/denoiser/.
 add_library(denoiser_core STATIC
     src/core.cpp
-    src/fft.cpp)
+    src/fft.cpp
+    src/resample.cpp src/host_rate.cpp)
 add_library(denoiser::core ALIAS denoiser_core)
 
 target_include_directories(denoiser_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
