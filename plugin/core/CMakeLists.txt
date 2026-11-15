@@ -23,3 +23,6 @@ target_sources(denoiser_core PRIVATE src/json.cpp src/tensor_file.cpp src/model_
 
 # Incremental TCN inference (issue #7)
 target_sources(denoiser_core PRIVATE src/tcn.cpp)
+
+# MLP and SNN inference, the shared Model and the per-channel denoiser (issue #6)
+target_sources(denoiser_core PRIVATE src/networks.cpp src/denoiser.cpp)
