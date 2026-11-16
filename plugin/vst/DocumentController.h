@@ -15,10 +15,17 @@
 //   host's readers (non-realtime, allowed by ARA), denoises them, publishes
 //   the stored audio into AudioSlots, reports progress (atomics, delivered
 //   to the host by its notifyModelUpdates()).
+// - One streaming thread per document controller: for sources whose
+//   original is not held in memory (too long, out of memory, the host failed
+//   to read them whole), makes a SourceStream per playback rate, publishes
+//   it into the source's AudioSlots and keeps reading the host's audio ahead
+//   of every region's play cursor into the streams' preallocated blocks.
 // - Audio threads (each bound instance's processBlock): the renderer reads
-//   its RenderPlan and the AudioSlots, without allocation or locks.
+//   its RenderPlan, the AudioSlots and the streams' blocks, and writes its
+//   regions' play cursors, without allocation or locks.
 // mutex_ protects the controller's state; it is never taken by an audio
-// thread, and the analysis thread doesn't hold it while working.
+// thread, and the analysis and streaming threads don't hold it while
+// reading or working.
 
 #include "AraEngine.h"
 
@@ -66,7 +73,9 @@ public:
     };
     ModelStatus getModelStatus() const;
 
-    enum class SourceState { Waiting, Reading, Denoising, Done, Original, Failed };
+    // Streamed: the original is played from the host as it plays (not held
+    // in memory, not denoised); the message says why
+    enum class SourceState { Waiting, Reading, Denoising, Done, Original, Failed, Streamed };
     struct SourceStatus {
         juce::String name;
         double sampleRate = 0.0;
@@ -85,6 +94,9 @@ public:
     // The slot holding `source`'s audio at `rate` (made on first use, which
     // asks the analysis for a version at that rate). Null for an unknown source.
     std::shared_ptr<enm156::ara::AudioSlot> slotFor(juce::ARAAudioSource* source, double rate);
+    // Any thread but the audio thread: the streaming thread should look at
+    // the cursors now (a non-realtime render waiting for streamed audio)
+    void wakeStreaming() { streamWake_.notify_all(); }
 
 protected:
     juce::ARAPlaybackRenderer* doCreatePlaybackRenderer() noexcept override;
@@ -107,22 +119,30 @@ private:
     enum Need : unsigned { kRead = 1, kDenoise = 2, kPublish = 4, kAll = 7 };
 
     struct Source;
+    // Why a source's original is streamed instead of held in memory
+    enum class Streaming { No, TooLong, ReadFailed, OutOfMemory };
 
     void loadModelLocked(const juce::String& path);
     void requestLocked(Source& source, unsigned needs);
     void updateWorkingLocked(Source& source);
     void captureProperties(Source& source);
+    void startStreamingLocked(Source& source, Streaming why, const juce::String& message);
     void notifyHostContentChanged();
     void rebuildPlans();
     void run();
     void runJob(Source& source, unsigned job);
-    enum class ReadResult { Ok, Cancelled, AccessLost, Failed };
-    ReadResult readSource(Source& source, enm156::ara::Planar& out);
+    enm156::ara::LoadResult readSource(Source& source, enm156::ara::Planar& out);
+    static enm156::ara::ReadStatus readFromHost(Source& source, int channels, std::int64_t position,
+                                                std::int64_t n, float* const* out, enm156::ara::Planar& scratch);
     void setStatus(Source& source, SourceState state, float progress, const juce::String& message);
     void publishAll(Source& source, denoiser::HighBand highBand);
+    void startStreaming(Source& source, Streaming why, const juce::String& message);
+    void streamRun();
+    void setUpStreams(Source& source);
 
     mutable std::mutex mutex_;
-    std::condition_variable wake_;
+    std::condition_variable wake_;        // the analysis thread
+    std::condition_variable streamWake_;  // the streaming thread
     std::atomic<bool> stop_{false};
     bool editing_ = false;
 
@@ -137,6 +157,7 @@ private:
     std::vector<DenoiserPlaybackRenderer*> renderers_;
 
     std::thread worker_;
+    std::thread streamer_;
 };
 
 class DenoiserPlaybackRenderer final : public juce::ARAPlaybackRenderer {
@@ -161,7 +182,8 @@ public:
     // Host document thread: the regions or their places changed
     void rebuildPlan();
 
-    // Longest a non-realtime render waits per block for analysis that is still running
+    // Longest a non-realtime render waits per block for analysis that is
+    // still running, or for streamed audio still being read
     static constexpr double kMaxOfflineWaitSeconds = 300.0;
 
 private:

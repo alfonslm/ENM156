@@ -731,6 +731,7 @@ void testBeforeAnalysis(Host& host) {
     doc->plugin->setRateAndBufferSizeDetails(48000, 4096);
     doc->plugin->prepareToPlay(48000, 4096);
 
+    std::printf("DEBUG reads before gate: %ld\n", access.reads.load());
     access.closeGate();
     check(doc->restore(settingsArchive(path)), "restore");
     if (!access.waitForArrivals(1)) {

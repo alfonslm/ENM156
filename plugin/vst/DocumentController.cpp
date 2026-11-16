@@ -11,20 +11,31 @@
 #include <new>
 
 using enm156::ara::AudioSlot;
+using enm156::ara::LoadResult;
 using enm156::ara::Outcome;
 using enm156::ara::Planar;
+using enm156::ara::ReadStatus;
 using enm156::ara::RenderPlan;
+using enm156::ara::SourceAudio;
+using enm156::ara::SourceStream;
 
 namespace {
 
 // The archive: a small binary record of the document settings
 constexpr int kArchiveMagic = 0x454e4d44;  // "ENMD"
 constexpr int kArchiveVersion = 1;
-constexpr std::int64_t kReadChunk = 1 << 16;
 
 int rateKey(double rate) {
     return int(std::lround(rate));
 }
+
+int keptChannels(int channels) {
+    return std::clamp(channels, 1, enm156::ara::kMaxSourceChannels);
+}
+
+// The streaming thread looks at the play cursors this often when it has
+// nothing to read (an audio thread cannot wake it)
+constexpr auto kStreamPoll = std::chrono::milliseconds(2);
 
 }  // namespace
 
@@ -43,6 +54,7 @@ struct DenoiserDocumentController::Source {
     double rate = 0.0;
     int channels = 0;
     std::int64_t length = 0;
+    bool tooLong = false;   // more than kMaxSourceSamples: never read whole
     bool eligible = false;  // the host ended the edit that created it
     bool accessEnabled = false;
     bool destroyed = false;
@@ -53,6 +65,18 @@ struct DenoiserDocumentController::Source {
     SourceState state = SourceState::Waiting;
     float progress = 0.0f;
     juce::String message;
+
+    // Streaming the original (mutex_): why, and the SourceAudio holding the
+    // stream for each playback rate (null: could not be made there)
+    Streaming streaming = Streaming::No;
+    std::uint64_t content = 0;         // counts changes of the source's samples
+    std::uint64_t streamsContent = 0;  // the content `streams` were made for
+    std::map<int, std::shared_ptr<const SourceAudio>> streams;
+    bool streamsUpToDate = true;       // every slot has its stream published
+    // Taken (before mutex_) by the analysis and the streaming thread while
+    // they publish into the slots, so that neither overwrites the other's
+    // newer decision (held in memory, or streamed)
+    std::mutex publishMutex;
 
     std::atomic<bool> cancel{false};
 
@@ -68,6 +92,7 @@ DenoiserDocumentController::DenoiserDocumentController(const ARA::PlugIn::PlugIn
     : ARADocumentControllerSpecialisation(entry, instance) {
     modelMessage_ = "No model chosen: the original audio plays. Choose a model in the plugin's window.";
     worker_ = std::thread([this] { run(); });
+    streamer_ = std::thread([this] { streamRun(); });
 }
 
 DenoiserDocumentController::~DenoiserDocumentController() {
@@ -78,7 +103,10 @@ DenoiserDocumentController::~DenoiserDocumentController() {
             entry.second->cancel = true;
     }
     wake_.notify_all();
+    streamWake_.notify_all();
+    // Each returns once a host read it has in progress returns
     worker_.join();
+    streamer_.join();
     for (auto& entry : sources_) {
         std::lock_guard<std::mutex> lock(entry.second->readerMutex);
         entry.second->reader.reset();
@@ -175,6 +203,7 @@ juce::String DenoiserDocumentController::describe(SourceState state) {
         case SourceState::Done: return "denoised";
         case SourceState::Original: return "original";
         case SourceState::Failed: return "failed";
+        case SourceState::Streamed: return "original (streamed)";
     }
     return {};
 }
@@ -197,17 +226,43 @@ void DenoiserDocumentController::requestLocked(Source& source, unsigned needs) {
     source.needs |= needs;
     if (source.running && (needs & (kRead | kDenoise)) != 0)
         source.cancel = true;  // the running job is out of date
+    if ((needs & kRead) != 0) {
+        ++source.content;  // streamed blocks read before are out of date
+        if (source.streaming != Streaming::No) {
+            source.streamsUpToDate = false;
+            streamWake_.notify_all();
+        }
+    }
     updateWorkingLocked(source);
 }
 
 void DenoiserDocumentController::updateWorkingLocked(Source& source) {
     // A render waits only for work that will actually run: not for a source
-    // the host has not released yet, nor one whose samples it can't read now
-    const bool runnable = source.eligible && !source.destroyed &&
-                          ((source.needs & kRead) == 0 || source.accessEnabled);
-    const bool working = source.running || (source.needs != 0 && runnable);
+    // the host has not released yet, nor one whose samples it can't read now.
+    // A too-long source is never analysed; setting up its streams counts.
+    const bool alive = source.eligible && !source.destroyed;
+    const bool runnable = alive && !source.tooLong && ((source.needs & kRead) == 0 || source.accessEnabled);
+    const bool streamSetUp = alive && source.streaming != Streaming::No && !source.streamsUpToDate;
+    const bool working = source.running || (source.needs != 0 && runnable) || streamSetUp;
     for (auto& slot : source.slots)
         slot.second->working = working;
+}
+
+void DenoiserDocumentController::startStreamingLocked(Source& source, Streaming why, const juce::String& message) {
+    source.streaming = why;
+    source.streamsUpToDate = false;
+    source.mainAudio = nullptr;  // a slot made from now on gets the stream
+    source.state = SourceState::Streamed;
+    source.progress = 0.0f;
+    source.message = message;
+    updateWorkingLocked(source);
+    streamWake_.notify_all();
+}
+
+void DenoiserDocumentController::startStreaming(Source& source, Streaming why, const juce::String& message) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!source.destroyed)
+        startStreamingLocked(source, why, message);
 }
 
 void DenoiserDocumentController::captureProperties(Source& source) {
@@ -219,6 +274,31 @@ void DenoiserDocumentController::captureProperties(Source& source) {
     source.rate = ara->getSampleRate();
     source.channels = ara->getChannelCount();
     source.length = ara->getSampleCount();
+    // A source too long to hold in memory plays its original, streamed
+    const int kept = keptChannels(source.channels);
+    if (std::int64_t(kept) * source.length > enm156::ara::kMaxSourceSamples) {
+        juce::String message = "Too long to analyse (" +
+                               juce::String(double(source.length) / std::max(source.rate, 1.0) / 60.0, 1) +
+                               " min; the limit is " + juce::String(enm156::ara::kMaxSourceSamples / kept) +
+                               " samples per channel): the original plays, read from the host as it plays, "
+                               "not denoised. Split it into shorter clips to denoise it.";
+        if (source.channels > enm156::ara::kMaxSourceChannels)
+            message << " Only the first " << enm156::ara::kMaxSourceChannels << " of " << source.channels
+                    << " channels are played.";
+        source.tooLong = true;
+        if (source.streaming != Streaming::TooLong || source.message != message)
+            startStreamingLocked(source, Streaming::TooLong, message);
+    } else if (source.tooLong) {
+        // No longer too long (its properties changed, which also asks for a
+        // new read): analysed as usual
+        source.tooLong = false;
+        source.streaming = Streaming::No;
+        source.streams.clear();
+        source.streamsUpToDate = true;
+        source.state = SourceState::Waiting;
+        source.message = {};
+        updateWorkingLocked(source);
+    }
 }
 
 void DenoiserDocumentController::didAddAudioSourceToDocument(juce::ARADocument*, juce::ARAAudioSource* ara) {
@@ -333,6 +413,7 @@ void DenoiserDocumentController::didEndEditing(juce::ARADocument*) {
         }
     }
     wake_.notify_all();
+    streamWake_.notify_all();
     rebuildPlans();
 }
 
@@ -375,6 +456,11 @@ std::shared_ptr<AudioSlot> DenoiserDocumentController::slotFor(juce::ARAAudioSou
             // hold the new slot yet, so this doesn't wait)
             if (rateKey(rate) == rateKey(source.rate) && source.mainAudio)
                 entry->publish(source.mainAudio);
+            // A streamed source: the streaming thread makes a stream at this rate
+            if (source.streaming != Streaming::No) {
+                source.streamsUpToDate = false;
+                streamWake_.notify_all();
+            }
             // A version at this rate: made from what the analysis has (or will have)
             requestLocked(source, kPublish);
         }
@@ -437,7 +523,8 @@ void DenoiserDocumentController::run() {
         std::shared_ptr<Source> next;
         for (auto& entry : sources_) {
             Source& s = *entry.second;
-            if (s.needs != 0 && s.eligible && !s.destroyed && ((s.needs & kRead) == 0 || s.accessEnabled)) {
+            if (s.needs != 0 && s.eligible && !s.destroyed && !s.tooLong &&
+                ((s.needs & kRead) == 0 || s.accessEnabled)) {
                 next = entry.second;
                 break;
             }
@@ -459,54 +546,50 @@ void DenoiserDocumentController::run() {
     }
 }
 
-DenoiserDocumentController::ReadResult DenoiserDocumentController::readSource(Source& source, Planar& out) {
-    double rate;
+ReadStatus DenoiserDocumentController::readFromHost(Source& source, int channels, std::int64_t position,
+                                                   std::int64_t n, float* const* out, Planar& scratch) {
+    // The host fills every channel of the source; those past the kept ones
+    // go to scratch
+    const int kept = keptChannels(channels);
+    const auto total = size_t(std::max(channels, kept));
+    if (scratch.size() < total - size_t(kept))
+        scratch.resize(total - size_t(kept));
+    std::vector<void*> pointers(total);
+    for (size_t c = 0; c < total; ++c) {
+        if (c < size_t(kept)) {
+            pointers[c] = out[c];
+        } else {
+            auto& extra = scratch[c - size_t(kept)];
+            if (std::int64_t(extra.size()) < n)
+                extra.resize(size_t(n));
+            pointers[c] = extra.data();
+        }
+    }
+    std::lock_guard<std::mutex> lock(source.readerMutex);
+    if (!source.reader)
+        return ReadStatus::NoAccess;  // read again once access is enabled
+    return source.reader->readAudioSamples(position, n, pointers.data()) ? ReadStatus::Ok : ReadStatus::Failed;
+}
+
+LoadResult DenoiserDocumentController::readSource(Source& source, Planar& out) {
     int channels;
     std::int64_t length;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        rate = source.rate;
         channels = source.channels;
         length = source.length;
     }
-    juce::ignoreUnused(rate);
-    const int kept = std::min(channels, enm156::ara::kMaxSourceChannels);
-    if (channels < 1 || length <= 0) {
-        out.assign(size_t(std::max(kept, 1)), {});
-        return ReadResult::Ok;
-    }
-    if (std::int64_t(kept) * length > enm156::ara::kMaxSourceSamples) {
-        setStatus(source, SourceState::Failed, 0.0f,
-                  "Too long to analyse (" + juce::String(double(length) / std::max(rate, 1.0) / 60.0, 1) +
-                      " min; the limit is " + juce::String(enm156::ara::kMaxSourceSamples / kept) +
-                      " samples per channel): this source plays silence. Split it into shorter clips.");
-        return ReadResult::Failed;
-    }
-    out.assign(size_t(kept), std::vector<float>(size_t(length)));
-    std::vector<std::vector<float>> chunk(static_cast<size_t>(channels),
-                                          std::vector<float>(static_cast<size_t>(kReadChunk)));
-    std::vector<void*> pointers(static_cast<size_t>(channels));
-    for (int c = 0; c < channels; ++c)
-        pointers[size_t(c)] = chunk[size_t(c)].data();
-    for (std::int64_t pos = 0; pos < length; pos += kReadChunk) {
-        if (source.cancel.load() || stop_)
-            return ReadResult::Cancelled;
-        const std::int64_t n = std::min(kReadChunk, length - pos);
-        {
-            std::lock_guard<std::mutex> lock(source.readerMutex);
-            if (!source.reader)
-                return ReadResult::AccessLost;  // read again once access is enabled
-            if (!source.reader->readAudioSamples(pos, n, pointers.data())) {
-                setStatus(source, SourceState::Failed, 0.0f,
-                          "The host could not read this source's audio: it plays silence.");
-                return ReadResult::Failed;
-            }
-        }
-        for (int c = 0; c < kept; ++c)
-            std::copy(chunk[size_t(c)].begin(), chunk[size_t(c)].begin() + n, out[size_t(c)].begin() + pos);
-        setStatus(source, SourceState::Reading, float(double(pos + n) / double(length)), {});
-    }
-    return ReadResult::Ok;
+    Planar scratch;
+    return enm156::ara::readWholeSource(
+        [&](std::int64_t position, std::int64_t n, float* const* into) {
+            return readFromHost(source, channels, position, n, into, scratch);
+        },
+        channels, length, out, [&](float fraction) {
+            if (source.cancel.load() || stop_)
+                return false;
+            setStatus(source, SourceState::Reading, fraction, {});
+            return true;
+        });
 }
 
 void DenoiserDocumentController::publishAll(Source& source, denoiser::HighBand highBand) {
@@ -515,8 +598,16 @@ void DenoiserDocumentController::publishAll(Source& source, denoiser::HighBand h
     const auto main = source.analysis.atSourceRate(highBand);
     std::vector<std::pair<int, std::shared_ptr<AudioSlot>>> slots;
     double rate;
+    const std::lock_guard<std::mutex> publishing(source.publishMutex);
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (source.tooLong || source.destroyed)
+            return;
+        // Held in memory from now on: no longer streamed
+        source.streaming = Streaming::No;
+        source.streams.clear();
+        source.streamsUpToDate = true;
+        updateWorkingLocked(source);
         source.mainAudio = main;
         slots.assign(source.slots.begin(), source.slots.end());
         rate = source.rate;
@@ -529,18 +620,157 @@ void DenoiserDocumentController::publishAll(Source& source, denoiser::HighBand h
     }
 }
 
+// ============================================================================
+// Streaming thread
+
+void DenoiserDocumentController::setUpStreams(Source& source) {
+    // What is needed: a stream for each slot (playback rate)
+    std::vector<std::pair<int, std::shared_ptr<AudioSlot>>> slots;
+    std::map<int, std::shared_ptr<const SourceAudio>> have;
+    double rate;
+    int channels;
+    std::int64_t length;
+    std::uint64_t content;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (source.streaming == Streaming::No || source.destroyed) {
+            source.streamsUpToDate = true;
+            updateWorkingLocked(source);
+            return;
+        }
+        if (source.streamsContent != source.content) {
+            source.streams.clear();  // read before the samples changed
+            source.streamsContent = source.content;
+        }
+        slots.assign(source.slots.begin(), source.slots.end());
+        have = source.streams;
+        rate = source.rate;
+        channels = keptChannels(source.channels);
+        length = source.length;
+        content = source.content;
+    }
+    bool outOfMemory = false;
+    for (const auto& slot : slots) {
+        if (have.count(slot.first) != 0)
+            continue;
+        std::shared_ptr<SourceAudio> audio;
+        try {
+            auto stream = std::make_shared<SourceStream>(rate, channels, length, slot.first);
+            audio = std::make_shared<SourceAudio>();
+            audio->sampleRate = slot.first;
+            audio->channels = stream->channels();
+            audio->length = stream->length();
+            audio->stream = std::move(stream);
+        } catch (const std::bad_alloc&) {
+            outOfMemory = true;  // silence at this rate
+        } catch (const std::invalid_argument&) {
+            // A rate that can't be resampled (as for analysed sources): silence there
+        }
+        have[slot.first] = std::move(audio);
+    }
+    const std::lock_guard<std::mutex> publishing(source.publishMutex);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (source.streaming == Streaming::No || source.destroyed || source.content != content)
+            return;  // decided otherwise meanwhile (the loop comes back if still needed)
+        source.streams = have;
+        if (outOfMemory)
+            source.message = "Out of memory: this source plays silence.";
+    }
+    for (const auto& slot : slots) {
+        const auto& audio = have[slot.first];
+        if (slot.second->current() != audio)
+            slot.second->publish(audio);
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    bool complete = source.content == content && source.streaming != Streaming::No;
+    for (const auto& slot : source.slots)
+        complete = complete && have.count(slot.first) != 0;
+    if (complete) {
+        source.streamsUpToDate = true;
+        updateWorkingLocked(source);
+    }
+}
+
+void DenoiserDocumentController::streamRun() {
+    struct Work {
+        std::shared_ptr<Source> source;
+        std::shared_ptr<SourceStream> stream;
+        std::shared_ptr<AudioSlot> slot;
+        int channels = 0;
+    };
+    std::vector<Work> work;
+    std::vector<enm156::ara::CursorState> cursors;
+    Planar scratch;
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (!stop_) {
+        // Streams to make or replace first (cheap, no host read)
+        std::shared_ptr<Source> setUp;
+        for (auto& entry : sources_) {
+            const Source& s = *entry.second;
+            if (s.streaming != Streaming::No && !s.streamsUpToDate && s.eligible && !s.destroyed) {
+                setUp = entry.second;
+                break;
+            }
+        }
+        if (setUp) {
+            lock.unlock();
+            setUpStreams(*setUp);
+            setUp.reset();
+            lock.lock();
+            continue;
+        }
+        for (auto& entry : sources_) {
+            Source& s = *entry.second;
+            if (s.streaming == Streaming::No || !s.eligible || s.destroyed)
+                continue;
+            for (auto& stream : s.streams) {
+                const auto slot = s.slots.find(stream.first);
+                if (stream.second && stream.second->stream && slot != s.slots.end())
+                    work.push_back({entry.second, stream.second->stream, slot->second, s.channels});
+            }
+        }
+        if (work.empty()) {
+            streamWake_.wait(lock);
+            continue;
+        }
+        lock.unlock();
+        // One block per stream per round, so that every stream keeps up
+        bool loaded = false;
+        for (const Work& w : work) {
+            if (stop_)
+                break;
+            w.slot->cursorStates(cursors);
+            const auto read = [&](std::int64_t position, std::int64_t n, float* const* out) {
+                return readFromHost(*w.source, w.channels, position, n, out, scratch);
+            };
+            loaded = w.stream->fillOne(cursors, read) == SourceStream::Fill::Loaded || loaded;
+        }
+        work.clear();
+        lock.lock();
+        if (!loaded && !stop_)
+            streamWake_.wait_for(lock, kStreamPoll);
+    }
+}
+
 void DenoiserDocumentController::runJob(Source& source, unsigned job) {
     std::shared_ptr<const denoiser::Model> model;
     denoiser::HighBand highBand;
     double rate;
     int channels;
+    Streaming streaming;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         model = model_;
         highBand = highBand_;
         rate = source.rate;
         channels = source.channels;
+        streaming = source.streaming;
     }
+    // A source streamed because reading it whole failed (or memory ran out)
+    // is tried again when the model is chosen again
+    if (streaming != Streaming::No && (job & kDenoise) != 0 && !source.analysis.hasInput())
+        job |= kRead;
     const auto notify = [&source](auto&& call) {
         std::lock_guard<std::mutex> lock(source.araMutex);
         if (source.ara != nullptr)
@@ -559,14 +789,36 @@ void DenoiserDocumentController::runJob(Source& source, unsigned job) {
         if ((job & kRead) != 0) {
             setStatus(source, SourceState::Reading, 0.0f, {});
             Planar input;
-            const ReadResult read = readSource(source, input);
-            if (read != ReadResult::Ok) {
-                if (read == ReadResult::Failed) {
-                    source.analysis = enm156::ara::SourceAnalysis();  // nothing to play
-                    publishAll(source, highBand);
-                } else {
-                    requeue(job);
-                    setStatus(source, SourceState::Waiting, 0.0f, {});
+            const LoadResult read = readSource(source, input);
+            if (read != LoadResult::Ok) {
+                Planar().swap(input);
+                switch (read) {
+                    case LoadResult::Failed:
+                        source.analysis = enm156::ara::SourceAnalysis();
+                        startStreaming(source, Streaming::ReadFailed,
+                                       "The host could not read this source's audio: the original plays as the "
+                                       "host delivers it, not denoised. It is read again when the source changes "
+                                       "or a model is chosen.");
+                        break;
+                    case LoadResult::OutOfMemory:
+                    case LoadResult::TooLong:
+                        source.analysis = enm156::ara::SourceAnalysis();
+                        startStreaming(source, Streaming::OutOfMemory,
+                                       "Out of memory: the original plays, read from the host as it plays, "
+                                       "not denoised.");
+                        break;
+                    case LoadResult::Ok:
+                    case LoadResult::Cancelled:
+                    case LoadResult::NoAccess: {
+                        requeue(job);
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        if (source.streaming == Streaming::No) {
+                            source.state = SourceState::Waiting;
+                            source.progress = 0.0f;
+                            source.message = {};
+                        }
+                        break;
+                    }
                 }
                 complete();
                 return;
@@ -611,9 +863,10 @@ void DenoiserDocumentController::runJob(Source& source, unsigned job) {
                       " channels are played.";
         setStatus(source, source.analysis.denoised() ? SourceState::Done : SourceState::Original, 1.0f, message);
     } catch (const std::bad_alloc&) {
+        // Nothing of it is kept in memory: its original is streamed instead
         source.analysis = enm156::ara::SourceAnalysis();
-        publishAll(source, highBand);
-        setStatus(source, SourceState::Failed, 0.0f, "Out of memory: this source plays silence.");
+        startStreaming(source, Streaming::OutOfMemory,
+                       "Out of memory: the original plays, read from the host as it plays, not denoised.");
     } catch (const std::exception& e) {
         setStatus(source, SourceState::Failed, 0.0f, "Analysis failed: " + juce::String::fromUTF8(e.what()));
     }
@@ -700,8 +953,12 @@ void DenoiserPlaybackRenderer::rebuildPlan() {
         const auto range =
             region->getSampleRange(sampleRate_, juce::ARAPlaybackRegion::IncludeHeadAndTail::no);
         const std::int64_t sourceStart = std::llround(region->getStartInAudioModificationTime() * sampleRate_);
-        plan->regions.push_back({range.getStart(), range.getEnd(), sourceStart - range.getStart(), slot.get()});
+        // Where this region wants the source read ahead, if it is streamed
+        auto cursor = slot->addCursor();
+        plan->regions.push_back(
+            {range.getStart(), range.getEnd(), sourceStart - range.getStart(), slot.get(), cursor.get()});
         plan->keepAlive.push_back(std::move(slot));
+        plan->cursors.push_back(std::move(cursor));
     }
     delete pending_.exchange(plan.release());  // one the audio thread hasn't taken was never used
     collectGarbage();
@@ -741,20 +998,32 @@ bool DenoiserPlaybackRenderer::processBlock(juce::AudioBuffer<float>& buffer, ju
     if (forceBypass_ || (bypassParam_ != nullptr && bypassParam_->load() >= 0.5f))
         target = 0.0f;
 
+    const std::int64_t position = positionInfo.getTimeInSamples().orFallback(0);
+    // Streamed sources are read ahead of this position, also while stopped
+    // (so that playback started here finds its audio)
+    if (active_ != nullptr)
+        enm156::ara::notePlayPosition(*active_, position);
+
     if (active_ == nullptr || !positionInfo.getIsPlaying() || channels < 1) {
         buffer.clear();
         mix_.setCurrentAndTargetValue(target);
         return true;
     }
     mix_.setTargetValue(target);
-    const std::int64_t position = positionInfo.getTimeInSamples().orFallback(0);
 
     if (realtime == juce::AudioProcessor::Realtime::no) {
-        // Offline (bounce / render): wait for analysis still running on these regions
+        // Offline (bounce / render): wait for analysis still running on
+        // these regions, then for streamed audio still being read (not while
+        // the host's reads fail)
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::duration<double>(kMaxOfflineWaitSeconds);
         while (enm156::ara::planIsWorking(*active_, position, n) && std::chrono::steady_clock::now() < deadline)
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        while (enm156::ara::planStreamState(*active_, position, n) == enm156::ara::StreamState::Pending &&
+               std::chrono::steady_clock::now() < deadline) {
+            owner_.wakeStreaming();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
     }
 
     float* const* data = buffer.getArrayOfWritePointers();
