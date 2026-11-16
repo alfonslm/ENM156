@@ -456,6 +456,19 @@ content change the original plays (the old result is wrong for the new
 samples). Disabling sample access destroys the reader (ARA's rule; a read in
 progress stops and starts again when access returns).
 
+**A source the plugin can't hold in memory plays its original, streamed**:
+one over the limit (below), one whose whole read or analysis runs out of
+memory, and one the host fails to read. It is not denoised (whatever the
+model), and it is never silenced for good: the plugin's **streaming thread**
+reads its original from the host ahead of where each region plays, into a
+fixed pool of preallocated blocks, and the renderer plays from there (see
+"Design" and "Streamed sources"). It plays silence only while the audio for
+the current position has not been read yet (right after a seek, a jump or a
+content change, or while the host is slow or failing), and catches up by
+itself. A source over the limit is never read whole; a source streamed after
+a read failure or out of memory is read whole again (and analysed) when the
+host reports a content change or a model is chosen.
+
 | situation | what plays | message (window / state) |
 |---|---|---|
 | no model chosen | the original | "No model chosen: the original audio plays. ..." |
@@ -464,8 +477,10 @@ progress stops and starts again when access returns).
 | a zero-length source | nothing | "Empty audio source." |
 | source rate not supported (below 16 kHz, or e.g. 47 999 Hz) | the original (at its own rate) | "Sample rate 8000 Hz is not supported ..." |
 | more than two channels | the first two | "Only the first 2 of N channels are played." |
-| longer than the limit (below) or out of memory | silence | "Too long to analyse ..." / "Out of memory ..." |
-| the host fails to read | silence | "The host could not read this source's audio ..." |
+| longer than the limit (below) | the original, streamed, not denoised | state "original (streamed)": "Too long to analyse (X min; the limit is N samples per channel): the original plays, read from the host as it plays, not denoised. ..." |
+| out of memory while reading or analysing it | the original, streamed, not denoised | "original (streamed)": "Out of memory: the original plays, read from the host as it plays, not denoised." |
+| the host fails to read it (whole) | the original, streamed, as soon as (and wherever) the host's reads succeed; silence where they fail | "original (streamed)": "The host could not read this source's audio: the original plays as the host delivers it, not denoised. ..." |
+| out of memory for the stream's own pool (8 MB) | silence at that rate | "Out of memory: this source plays silence." |
 
 ### Design: classes and threads
 
@@ -483,7 +498,24 @@ progress stops and starts again when access returns).
   `SourceAudio` to play at the source's rate or at another rate.
 - `SourceAudio`: what one source plays at one sample rate: the original
   (shared, not copied, between versions) and the denoised samples (or none
-  yet). Immutable once published.
+  yet), or instead a `SourceStream`. Immutable once published.
+- `SourceStream` (AraEngine.h, no JUCE): the original of a streamed source at
+  one playback rate. A pool of 64 blocks of 16 384 frames (all channels,
+  allocated once: 8 MB for stereo), each with an atomic tag (which block it
+  holds) and a reader count. The audio thread finds a block by its tag,
+  registers, checks the tag again and copies; the streaming thread replaces
+  a block by clearing its tag, waiting until no reader is registered (at
+  most one copy of 256 samples), filling it from data it already read, and
+  setting the tag. Wait-free for the audio thread (atomic loads and
+  increments only). The host is never read while a block is being replaced.
+- `PlayCursor`: one per region in a render plan, registered with the
+  region's slot. The audio thread writes into it, every block (also while
+  the transport is stopped), where its region will play next and how many
+  frames until then; the streaming thread reads every slot's cursors and
+  loads, one block at a time, the block wanted soonest (frames until it
+  plays, over all cursors, up to 8 blocks = 131 072 frames ahead: 2.7 s at
+  48 kHz, 0.7 s at 192 kHz), evicting a block no cursor wants (the oldest
+  first) or one wanted later than it.
 - `AudioSlot`: where a source's `SourceAudio` (for one playback rate) is
   published. **Hand-over without locks**: the analysis thread stores the new
   pointer, then waits until no audio thread can still read the old one, then
@@ -500,20 +532,32 @@ progress stops and starts again when access returns).
   the slots) on the host's document thread whenever the host ends an edit
   or prepares the instance, and handed to the audio thread like the
   real-time engine (one atomic pointer; the old plan is retired to one of 8
-  slots and freed on the control side). The audio thread reads only the plan
-  and the slots: no ARA model objects, no allocation, no locks, no file or
-  host reads (counted: 0 allocations through the whole VST3 call, see
-  Tests).
+  slots and freed on the control side). The audio thread reads only the plan,
+  the slots and the streams' blocks, and writes the plan's cursors: no ARA
+  model objects, no allocation, no locks, no file or host reads (counted: 0
+  allocations through the whole VST3 call, also while streaming, see Tests).
 - Who owns the stored audio: the slot owns the current `SourceAudio` (plus
-  the analysis's copy of the original, shared); plans own slots; the
-  document controller owns sources. Everything is freed off the audio thread.
+  the analysis's copy of the original, shared; a stream is shared by every
+  publication for its source and rate, and the source record keeps it too);
+  plans own slots and cursors; the document controller owns sources.
+  Everything is freed off the audio thread.
 - Threads: the **host's document thread** (all ARA model calls, archives,
   sample access; the editor's model choice; normally the message thread)
   creates and destroys the host audio readers (ARA allows that only inside
   those calls); the **analysis thread** reads, denoises and publishes; the
-  **audio threads** render. One mutex protects the controller's state; the
-  audio threads never take it, the analysis thread doesn't hold it while
-  working.
+  **streaming thread** makes and publishes the streams of streamed sources
+  (one per playback rate in use) and fills them through the same host reader
+  as the analysis (one mutex per source serialises the two; ARA allows reads
+  from any non-realtime thread, not two at once on one reader); the **audio
+  threads** render. One mutex protects the controller's state; the audio
+  threads never take it, the analysis and streaming threads don't hold it
+  while reading or working. A per-source publish mutex keeps the analysis
+  and the streaming thread from overwriting each other's newer decision
+  (held in memory, or streamed). The streaming thread waits on a condition
+  variable while no source is streamed; while one is, it looks at the
+  cursors every 2 ms when it has nothing to read (an audio thread can't wake
+  it). Destroying the document stops both threads, after a host read they
+  have in progress returns.
 
 ### Where the model and the settings live
 
@@ -560,8 +604,50 @@ read-ahead thread and real-time-safe buffering) and costs nothing to set up;
 a DAW project with several hour-long sources would want a file-backed store,
 which is not done. **Limit: 400 million samples per source** (all channels:
 69 minutes of 48 kHz stereo, 2.3 hours of 48 kHz mono); a longer source is not
-read and plays silence with a message, and an allocation failure does the
-same ("Out of memory"). There is no limit on the number of sources.
+read whole and **plays its original, streamed** (not denoised), with a
+message, and an allocation failure does the same ("Out of memory"). There is
+no limit on the number of sources.
+
+### Streamed sources
+
+- **What plays**: the original, sample-aligned with the timeline like any
+  source (same mapping), at its own rate the samples as the host delivers
+  them (bit for bit). Mix and bypass change nothing (there is no denoised
+  signal; the output is the original at any mix).
+- **Read-ahead**: per region, up to 131 072 frames (8 blocks) ahead of where
+  it plays, also before a region starts (its first blocks are read when the
+  play position is within that distance of it) and while the transport is
+  stopped (if the host calls the plugin then, as most do). A seek, a jump or
+  a loop back to a place not in the pool plays silence until its block is
+  read (one host read of 16 384 frames plus at most 2 ms), then continues.
+  The pool keeps 64 blocks (21.8 s at 48 kHz); blocks no region wants stay
+  until needed, so a short loop keeps playing from memory.
+- **Several regions and renderers**: one stream per source and playback
+  rate, shared by every region and renderer playing it at that rate; each
+  region has its own cursor, and the most urgent block over all cursors is
+  read first. More than about 7 regions of one source playing at different
+  places at once share the pool and get less read-ahead each.
+- **At another playback rate** than the source's: the stream's blocks are
+  computed through 16 kHz, from a window of the source with margins wider
+  than the filters, its ends on the filters' periods, so every sample is
+  what an analysed source's original plays there (the whole clip through
+  16 kHz: band-limited to ~7.5 kHz; measured equal, error 0). A source
+  whose own rate is unsupported plays silence at other rates (as analysed
+  sources do).
+- **Offline (non-realtime) renders and bounces wait** (up to 300 s per
+  block) until the streamed audio of the block is read, so a bounce contains
+  the complete original from its first sample. They don't wait while the
+  host's reads fail (that audio is silent in the bounce).
+- **Content changes, sample access, model**: a content update (or new
+  properties) makes the source's streams silent at once and replaces them
+  with new ones (read again); while sample access is off, what is in the
+  pool keeps playing and nothing new is read; the model and the high-band
+  choice don't change a streamed source (a source over the limit is not
+  analysed whatever the model), but choosing a model reads a source streamed
+  after a read failure or out of memory whole again. Removing a region or a
+  source while it plays: the renderer's new plan drops it; the stream is
+  freed off the audio thread. The archive stores nothing about it: after a
+  restore it is streamed again.
 
 ### Sample rates
 
@@ -574,7 +660,8 @@ same ("Out of memory"). There is no limit on the number of sources.
   original, both upsampled from 16 kHz), so it is the same denoised signal,
   sample-aligned in time; the original there is band-limited to ~7.5 kHz and
   the high band can't be passed through (dropped). A source whose own rate is
-  unsupported plays silence at other rates.
+  unsupported plays silence at other rates. A streamed source plays its
+  original through 16 kHz in the same way (see "Streamed sources").
 - Timeline → source mapping: a region plays its modification range 1:1 from
   its start on the timeline (`getSampleRange` at the render rate; source
   sample = timeline sample − round(start in playback time · rate) +
@@ -586,11 +673,12 @@ same ("Out of memory"). There is no limit on the number of sources.
 
 - Realtime: whatever is stored now plays (the original before the analysis
   finishes, silence before the source has been read; reading is fast
-  compared with denoising).
+  compared with denoising); for a streamed source, what has been read ahead.
 - **Offline (non-realtime) renders and bounces wait** for analysis that is
   queued or running for the regions in the block (up to 300 s per block),
-  so a bounce right after loading a model contains the denoised audio. Not
-  for sources the host hasn't released yet or can't be read.
+  so a bounce right after loading a model contains the denoised audio, and
+  for streamed audio still to be read. Not for sources the host hasn't
+  released yet or can't read now.
 - Editor renderer (preview): **not provided** beyond JUCE's default (which
   adds nothing). The plugin has no ARA editor view of its own (no waveform,
   no regions to audition in its window), so nothing would call for a
@@ -605,22 +693,37 @@ same ("Out of memory"). There is no limit on the number of sources.
 
 | test | what |
 |---|---|
-| `plugin_ara` | `vst/AraHostTest.cpp`: a **headless ARA host** made of JUCE's ARA hosting classes (`ARAHostDocumentController`, `ARAHostModel::*`) on the ARA SDK's host dispatch library. It loads the built `.vst3` with JUCE's VST3 hosting, creates ARA documents (musical context, region sequence, in-memory audio sources read through its audio access controller, modifications, playback regions), binds instances as playback renderers, gives the document its settings through `restoreObjectsFromArchive`, renders through the VST3 `process` call with a play head, and compares with the core. Covers: a whole source at 16 kHz equals `denoiseClip` (MLP, SNN, TCN, centred MLP; mono and stereo), at 44.1 and 48 kHz equals `denoiseClipAtRate` (MLP, TCN with the high band passed, centred TCN); a region moved to 0.5 s, trimmed (0.25–0.6 s of the source at 0.1 s, changed while prepared), split in two with the second part moved, a second use of the same source elsewhere (silence around and between); **realtime playback before the analysis finishes is the original bit for bit** (silence before the source has been read), then the denoised audio in the same prepared renderer, and the host receives started / updated / completed progress; a content update (sample access off, new samples, on, `updateAudioSourceContent`) gives the new source's denoised audio; a model change gives the new model's output; bypass and mix 0 give the original bit for bit, mix 0.5 the mean; `storeObjectsToArchive` → a new document → `restoreObjectsFromArchive` gives the same output and model path; a missing model file plays the original with "not found" and keeps the path; a 44.1 kHz source played at 48 kHz equals the 16 kHz result upsampled; a too-short source with a centred model, an empty source and an 8 kHz source (silence at 48 kHz, the original at 8 kHz) with their messages; on Linux, **0 heap allocations** over 400 realtime blocks of 1–512 samples with two regions, through JUCE's hosting, the VST3 wrapper and the renderer. Measured error: **0** in every comparison (the tolerance is 1e-5 of max(1, \|ref\|), as in `plugin_vst3`), Release with LTO and Debug, GCC 13. ~0.3 s in Release, ~1.5 s in Debug. |
-| `plugin_ara_engine` | `vst/AraEngineTest.cpp`, no JUCE: `SourceAnalysis` equals `denoiseClipAtRate` (MLP / SNN / TCN / two centred models at 16, 44.1, 48 kHz, both high-band choices; versions at another rate); no model, too short, empty, unsupported rates, >2 channels, cancellation; `renderPlan` mapping for moved / trimmed / split / overlapping regions, regions before the source's start or past its end, mono / stereo in and out, mix 0 / 0.25 / 1; 0 allocations in `renderPlan`; `AudioSlot` under load: one thread publishes new audio while two render from it for 1 s (~10 000 publications, ~600 000 blocks), no block mixes two publications. |
+| `plugin_ara` | `vst/AraHostTest.cpp`: a **headless ARA host** made of JUCE's ARA hosting classes (`ARAHostDocumentController`, `ARAHostModel::*`) on the ARA SDK's host dispatch library. It loads the built `.vst3` with JUCE's VST3 hosting, creates ARA documents (musical context, region sequence, in-memory audio sources read through its audio access controller, modifications, playback regions), binds instances as playback renderers, gives the document its settings through `restoreObjectsFromArchive`, renders through the VST3 `process` call with a play head, and compares with the core. Covers: a whole source at 16 kHz equals `denoiseClip` (MLP, SNN, TCN, centred MLP; mono and stereo), at 44.1 and 48 kHz equals `denoiseClipAtRate` (MLP, TCN with the high band passed, centred TCN); a region moved to 0.5 s, trimmed (0.25–0.6 s of the source at 0.1 s, changed while prepared), split in two with the second part moved, a second use of the same source elsewhere (silence around and between); **realtime playback before the analysis finishes is the original bit for bit** (silence before the source has been read), then the denoised audio in the same prepared renderer, and the host receives started / updated / completed progress; a content update (sample access off, new samples, on, `updateAudioSourceContent`) gives the new source's denoised audio; a model change gives the new model's output; bypass and mix 0 give the original bit for bit, mix 0.5 the mean; `storeObjectsToArchive` → a new document → `restoreObjectsFromArchive` gives the same output and model path; a missing model file plays the original with "not found" and keeps the path; a 44.1 kHz source played at 48 kHz equals the 16 kHz result upsampled; a too-short source with a centred model, an empty source and an 8 kHz source (silence at 48 kHz, the original at 8 kHz) with their messages; on Linux, **0 heap allocations** over 400 realtime blocks of 1–512 samples with two regions, through JUCE's hosting, the VST3 wrapper and the renderer. **Streamed sources**: the host *declares* sources over the limit (200 000 001 frames of 48 kHz stereo; 400 000 001 of mono; 200 000 001 of 44.1 kHz stereo) without holding their samples and synthesises each sample in its reader as a function of the position, so every played block is compared with the original **bit for bit**. Realtime (the renderer plays the same stretch again until the read-ahead has caught up; every sample of every pass must be the original or silence): from the start, the middle, after a seek back and forward, to the end of the source (silence after it); the plugin read under 1 % of the source meanwhile; an offline render at a place never played is complete from its first sample; mix 0.5 and bypass give the original; sample access off while playing (what was read keeps playing, nothing new appears), new samples, access on and a content update: the new samples play (never the old ones); store → new document → restore: streamed again, same model path; a moved and trimmed region and a second region of the same mono source overlapping it (their sum), offline and realtime; 44.1 kHz played at 48 kHz equals the core through 16 kHz (1e-5; measured 0); a host whose reads fail: silence and the message, then the original once its reads succeed, then a content update analyses and denoises it as usual; the document destroyed (on its own thread) while a streaming read waits in the host: destruction waits for the read, then no host reader is alive, nothing reads any more and the process has no more threads than before; on Linux, **0 heap allocations** over 400 realtime blocks of a streamed source (with a seek) while the streaming thread reads (~390 000 frames read during the count). Measured error: **0** in every comparison (the tolerance is 1e-5 of max(1, \|ref\|), as in `plugin_vst3`), Release with LTO and Debug, GCC 13. |
+| `plugin_ara_engine` | `vst/AraEngineTest.cpp`, no JUCE: `SourceAnalysis` equals `denoiseClipAtRate` (MLP / SNN / TCN / two centred models at 16, 44.1, 48 kHz, both high-band choices; versions at another rate); no model, too short, empty, unsupported rates, >2 channels, cancellation; `renderPlan` mapping for moved / trimmed / split / overlapping regions, regions before the source's start or past its end, mono / stereo in and out, mix 0 / 0.25 / 1; 0 allocations in `renderPlan` (also with a streamed region and its cursor); `AudioSlot` under load: one thread publishes new audio while two render from it for 1 s (~10 000 publications, ~600 000 blocks), no block mixes two publications. `SourceStream`: at its own rate the samples bit for bit (mono, stereo, stereo on a mono output, across block edges, the partial last block); at another rate (44.1 → 48, 48 → 44.1, 16 → 48, 48 → 16 kHz) equal to what an analysed source's original plays there (`atRate`, 1e-6; measured 0), from blocks anywhere in the source; read-ahead and nothing past it; a region starting further ahead than the read-ahead is not read yet, one starting sooner is; with 20 cursors each one's current block is read; a failed read installs nothing, sets `failing()`, is not retried before 50 ms and then succeeds. `readWholeSource`: whole, more than 2 channels, too long (nothing allocated), host failure, no access, cancellation. **Out of memory**: with the test's `operator new` refusing requests over 16 MB (a machine short of memory), reading a 10 M-frame stereo source whole gives `OutOfMemory` and keeps nothing, and a stream of it (8 MB) plays its original bit for bit (counting builds only, i.e. not under sanitizers). **Stress**: a reader thread fills a stream of a 50 M-frame source while two audio threads render two regions of it each with random seeks (~5x real time): every sample is the original, the sum of the two, one of them or silence, never anything else; most blocks are complete. |
 | `offline_rate` (core) | `tests/test_offline_rate.cpp`: `modelRateLength`; 16 kHz copies and equals `denoiseClip` bit for bit; alignment at 22.05, 44.1, 48, 96 kHz: a band-limited signal to 16 kHz matches the same signal computed at 16 kHz to −114 dB, the round trip matches the input to −108 dB (one sample off: −6 to −18 dB); `denoiseClipAtRate` equals the parts composed by hand, PassThrough − Drop = input − round trip; short clips for centred models, unsupported rates, empty clips, cancellation. |
 | `cli` | also `denoise --resample` at 48 kHz (causal and centred, both high-band choices) equals `denoiseClipAtRate` (1e-5), and its error cases. |
 
 How `plugin_ara` holds "before the analysis finishes": only through what a
 host controls; the plugin has no test hook and reads no environment
-variable. The host keeps the plugin's first read of the source waiting,
-reports a content change of the source meanwhile (`updateAudioSourceContent`,
-same samples) and lets that read finish; the plugin publishes the original
-it read, stops the now out-of-date denoising at its first frame and reads
-again, and the host keeps that second read waiting while it plays and
-checks. No sleep decides the outcome. The check relies on the plugin
-publishing a read that was already in progress when the content changed; if
-the plugin ever drops such a read instead, it fails (silence instead of the
-original) and has to be rethought.
+variable. The host closes its read gate and gives the document its model
+*before* it adds the source (the plugin reads a source as soon as the edit
+that adds it ends; closing the gate after that was a race the test lost
+whenever the analysis thread got there first, on main too), keeps the
+plugin's first read of the source waiting, reports a content change of the
+source meanwhile (`updateAudioSourceContent`, same samples) and lets that
+read finish; the plugin publishes the original it read, stops the now
+out-of-date denoising at its first frame and reads again, and the host keeps
+that second read waiting while it plays and checks. No sleep decides the
+outcome. The check relies on the plugin publishing a read that was already
+in progress when the content changed; if the plugin ever drops such a read
+instead, it fails (silence instead of the original) and has to be rethought.
+
+Streamed sources are tested the same way, through what a host controls: it
+declares a source longer than the limit (an ARA source's length is a
+property the host gives), makes its reads fail and succeed, holds them at
+its gate, and switches sample access; the limit itself is not lowered, and
+the shipped plugin has no hook for it. The allocation failure can't be
+caused honestly from a host, so it is tested below the ARA interface
+(`plugin_ara_engine`, above): the engine's whole-source read reports it and
+the stream works within the memory left. The document controller's reaction
+to it (switch the source to streaming) is the same call as for a host read
+failure, which `plugin_ara` covers; the out-of-memory path through the
+controller itself is not exercised.
 
 ### What was run (and on what)
 
@@ -696,6 +799,18 @@ only on Linux/glibc).
 - Two channels per source at most.
 - Memory as above; no on-disk cache, so reopening a project analyses every
   source again (11–46× real time for config.toml-sized models on one core).
+- A source over the limit (or out of memory) is **not denoised**: its
+  original plays, streamed. Denoising it needs a file-backed store or
+  splitting it into shorter clips.
+- Streamed sources: after a seek, a jump or a loop back to a place not in
+  the 64-block pool (21.8 s at 48 kHz), silence until the host has delivered
+  one block (16 384 frames) and at most 2 ms; loop points aren't read ahead
+  (a loop longer than the pool has that gap at each loop start). More than
+  about 7 regions of one source playing at different places at once get less
+  read-ahead each. While the host's reads fail, that audio is silent, also
+  in a bounce. The streaming thread looks at the cursors every 2 ms while a
+  source is streamed. A source whose own rate is unsupported plays silence at
+  other playback rates.
 - The analysis uses one thread per document.
 - Logic (ARA through Audio Units) is out of scope (no AU target).
 - The host's document thread is assumed to be the message thread when the
@@ -788,6 +903,17 @@ and may differ slightly by version.
     original plays), two instances on different tracks sharing the model,
     and that the project's CPU load during playback is negligible (all work
     happens in the analysis).
+11. **A long recording** (over 69 minutes of 48 kHz stereo, or over 2.3 hours
+    of mono; a file made by concatenating takes will do): insert the plug-in
+    on it with a model loaded. The source list says "original (streamed)"
+    and "Too long to analyse ...". It must **play, unprocessed and in sync**
+    (null test as in step 4, at any Mix), from the start, after locating to
+    its middle and end, after moving / trimming / splitting it, and in a
+    loop; after a jump a gap of a few milliseconds at most. Bounce a stretch
+    of it from its middle: the bounce must contain the complete original (no
+    gaps). Also try it at another project rate (dull above ~7.5 kHz, in
+    sync), and take the file offline / rename it while the project is open,
+    then bring it back (silence while missing, then the original again).
 
 ## Layout
 
