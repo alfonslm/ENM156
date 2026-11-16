@@ -46,6 +46,17 @@ cmake -S plugin -B plugin/build-plugin -G Ninja -DDENOISER_BUILD_PLUGIN=ON && cm
 CI builds and tests the core and the plugin on Linux, Windows and macOS for
 changes under `plugin/`.
 
+## Pull requests and the owner
+
+- Open a pull request as a **draft**, and keep it a draft while it is being
+  worked on or reviewed by a session. A draft asks nothing of the owner.
+- **Mark it ready for review when, and only when, the owner should look at
+  it**: it waits for them to merge, or it needs a decision that is theirs.
+  Say at the top of the description what they are being asked to do.
+- A worker's pull request that the session merges itself (below) is marked
+  ready only at the moment it is merged: the owner is not being asked to
+  look at it.
+
 ## Working with workers
 
 When work is split between several agents:
