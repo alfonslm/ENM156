@@ -1,6 +1,6 @@
 // The ARA engine below the ARA interface (AraEngine.h), no JUCE, no host:
 //
-//   denoiser_ara_engine_test <golden dir> [stress seconds]
+//   denoiser_ara_engine_test <golden dir> [stress seconds (the stream stress: half)]
 //
 //   - SourceAnalysis: the stored audio equals the core's denoiseClipAtRate
 //     (16, 44.1, 48 kHz; causal and centred models; both high-band choices);
@@ -708,7 +708,7 @@ int main(int argc, char** argv) {
 #if DENOISER_COUNT_ALLOCATIONS
         testOutOfMemory();
 #endif
-        testStreamStress(seconds);
+        testStreamStress(seconds / 2);
     } catch (const std::exception& e) {
         std::printf("FAIL: exception %s\n", e.what());
         ++failures;

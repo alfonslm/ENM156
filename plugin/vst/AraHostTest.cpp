@@ -1153,11 +1153,25 @@ bool playsOriginal(Document& doc, double rate, std::int64_t start, const Audio& 
                    bool strict = true) {
     const auto n = std::int64_t(expected[0].size());
     int passes = 0;
-    for (const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(20);
-         std::chrono::steady_clock::now() < until; ++passes) {
+    const auto begin = std::chrono::steady_clock::now();
+    for (const auto until = begin + std::chrono::seconds(20); std::chrono::steady_clock::now() < until; ++passes) {
+        // The host locates to the start with the transport stopped (it still
+        // calls the plugin), then plays. The test plays much faster than real
+        // time: without this the play position would spend only a fraction
+        // of a millisecond at the start of the stretch per pass.
+        {
+            juce::AudioBuffer<float> buffer(doc.channels, 64);
+            juce::MidiBuffer midi;
+            doc.playHead.time = start;
+            doc.playHead.playing = false;
+            doc.plugin->processBlock(buffer, midi);
+            doc.playHead.playing = true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
         const Audio out = doc.renderPrepared(rate, start, n, 512);
         if (sameAudio(out, expected)) {
-            std::printf("  %s: the original, bit for bit, after %d pass(es)\n", what.toRawUTF8(), passes + 1);
+            std::printf("  %s: the original, bit for bit, after %d pass(es), %.1f ms\n", what.toRawUTF8(), passes + 1,
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
             return true;
         }
         if (strict)
@@ -1167,7 +1181,6 @@ bool playsOriginal(Document& doc, double rate, std::int64_t start, const Audio& 
                         fail(what + ": a sample neither the original nor silence, at " + juce::String(start + std::int64_t(i)));
                         return false;
                     }
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
     fail(what + ": not the original after 20 s");
     return false;
