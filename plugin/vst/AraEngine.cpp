@@ -106,8 +106,7 @@ std::int64_t rateRound(double rate) {
 }  // namespace
 
 SourceStream::SourceStream(double sourceRate, int channels, std::int64_t sourceLength, int playbackRate)
-    : sourceRate_(sourceRate),
-      channels_(std::clamp(channels, 1, kMaxSourceChannels)),
+    : channels_(std::clamp(channels, 1, kMaxSourceChannels)),
       sourceLength_(std::max<std::int64_t>(sourceLength, 0)),
       playbackRate_(playbackRate) {
     if (rateRound(sourceRate) == playbackRate) {

@@ -140,7 +140,6 @@ private:
     ReadStatus compute(std::int64_t block, const SourceReader& read);
     std::int64_t urgency(std::int64_t block, const std::vector<CursorState>& cursors) const noexcept;
 
-    double sourceRate_;
     int channels_;
     std::int64_t sourceLength_;
     int playbackRate_;
