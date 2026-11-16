@@ -772,6 +772,19 @@ only on Linux/glibc).
   and it gives the plugin no model, so its value is the API conformance of
   the document controller under a second, independent host.
   Run as `ARATestHost -vst3 "<...>/ENM156 Denoiser.vst3/Contents/x86_64-linux/ENM156 Denoiser.so"`.
+- **Streamed sources** (the change that streams the original of sources not
+  held in memory), Linux x86-64, GCC 13: ctest Release (LTO) all 22 pass
+  (`plugin_ara` ~1 s, `plugin_ara_engine` ~2.3 s); `plugin_ara` and
+  `plugin_ara_engine` 20 times in a row; **ThreadSanitizer** (RelWithDebInfo,
+  everything instrumented): `plugin_ara_engine` with a 10 s slot stress and
+  a 5 s stream stress (3 561 blocks loaded during 62 307 rendered blocks, 0
+  wrong samples) and `plugin_ara` 5 times, **no reports**; **AddressSanitizer
+  + UBSan** (Debug): all 22 tests and the two ARA tests 5 more times, **no
+  reports**; Clang 18 `-fsyntax-only` with the project's warnings on the
+  changed files: none; Steinberg's validator 47 / 47 and pluginval
+  strictness 10 with GUI tests under Xvfb: SUCCESS. Streaming was not tried
+  with a real host's disk reads (the tests synthesise the samples) or in a
+  DAW.
 - Not run: anything on Windows or macOS (CI will run the ctest part), any
   DAW, the ARA-mode window (it compiles and is shared with the tested VST3
   window, but no test opens it bound to ARA).
