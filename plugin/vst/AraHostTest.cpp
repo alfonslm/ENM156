@@ -714,26 +714,28 @@ void testBeforeAnalysis(Host& host) {
     auto doc = host.createDocument(2);
     if (!doc || !model)
         return;
-    const Audio data = noise(2, 24000, 31);  // one host read (the plugin asks for 65536 samples at a time)
-    auto& src = doc->addSource(data, 48000, "source-h");
-    doc->addRegion(src, 0.0, 0.5, 0.0);
     AudioAccess& access = *doc->access;
     // The plugin's analysis thread must not be left waiting at the gate when the document goes
     struct OpenGateAtEnd {
         AudioAccess& access;
         ~OpenGateAtEnd() { access.openGate(); }
     } openGateAtEnd{access};
+    // The gate is closed and the model given before the source exists: the
+    // plugin reads a source as soon as the edit that adds it ends, so this is
+    // the only order in which its first read is held whatever the timing
+    access.closeGate();
+    check(doc->restore(settingsArchive(path)), "restore");
+    const Audio data = noise(2, 24000, 31);  // one host read (the plugin asks for 65536 samples at a time)
+    auto& src = doc->addSource(data, 48000, "source-h");
+    doc->addRegion(src, 0.0, 0.5, 0.0);
 
-    // Prepared for realtime playback before the analysis starts: what it plays
-    // is replaced while it stays prepared
+    // Prepared for realtime playback before the analysis finishes: what it
+    // plays is replaced while it stays prepared
     doc->plugin->releaseResources();
     doc->plugin->setNonRealtime(false);
     doc->plugin->setRateAndBufferSizeDetails(48000, 4096);
     doc->plugin->prepareToPlay(48000, 4096);
 
-    std::printf("DEBUG reads before gate: %ld\n", access.reads.load());
-    access.closeGate();
-    check(doc->restore(settingsArchive(path)), "restore");
     if (!access.waitForArrivals(1)) {
         fail("the plugin did not read the source");
         return;
