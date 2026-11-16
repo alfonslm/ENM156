@@ -176,6 +176,38 @@ void testAnalysisEdges() {
     check(!a.denoised(), "cancelled: nothing denoised");
 }
 
+// A source of any length without its samples in memory: each sample a
+// deterministic function of (channel, position), exactly representable
+float synth(int channel, std::int64_t k, std::uint64_t seed = 0) {
+    std::uint64_t x = std::uint64_t(k) * 0x9E3779B97F4A7C15ull + std::uint64_t(channel + 1) * 0x632BE59BD9B4E019ull +
+                      seed * 0xD6E8FEB86659FD93ull;
+    x ^= x >> 29;
+    x *= 0xBF58476D1CE4E5B9ull;
+    x ^= x >> 32;
+    return float((x >> 40) & 0xFFFFFFu) / 16777216.0f - 0.5f;
+}
+
+struct SynthSource {
+    int channels = 2;
+    std::int64_t length = 0;
+    std::uint64_t seed = 0;
+    std::atomic<bool> fail{false};
+    std::atomic<long> reads{0};
+    SourceReader reader() {
+        return [this](std::int64_t pos, std::int64_t n, float* const* out) {
+            if (pos < 0 || n < 0 || pos + n > length)
+                return ReadStatus::Failed;  // outside the source: the caller's bug
+            ++reads;
+            if (fail.load())
+                return ReadStatus::Failed;
+            for (int c = 0; c < channels; ++c)
+                for (std::int64_t i = 0; i < n; ++i)
+                    out[c][i] = synth(c, pos + i, seed);
+            return ReadStatus::Ok;
+        };
+    }
+};
+
 // ---- Rendering ----
 
 std::shared_ptr<AudioSlot> slotWith(int channels, std::int64_t n, float dryBase, float wetBase, bool wet) {
@@ -294,15 +326,39 @@ void testNoAllocation() {
     auto a = slotWith(2, 48000, 0.0f, 1.0f, true);
     auto b = slotWith(1, 4800, 0.0f, 1.0f, false);
     auto empty = std::make_shared<AudioSlot>();
+    // A streamed source, half of what is played read
+    SynthSource src;
+    src.length = 1'000'000;
+    auto stream = std::make_shared<SourceStream>(48000, 2, src.length, 48000);
+    {
+        const std::vector<CursorState> cursors{CursorState{0, 0}};
+        const auto read = src.reader();
+        stream->fillOne(cursors, read);
+        stream->fillOne(cursors, read);
+    }
+    auto streamedAudio = std::make_shared<SourceAudio>();
+    streamedAudio->channels = 2;
+    streamedAudio->length = stream->length();
+    streamedAudio->stream = stream;
+    auto s = std::make_shared<AudioSlot>();
+    s->publish(streamedAudio);
+    auto cursor = s->addCursor();
     RenderPlan plan;
-    plan.keepAlive = {a, b, empty};
-    plan.regions = {{0, 48000, 0, a.get()}, {1000, 5800, -1000, b.get()}, {0, 100000, 0, empty.get()}};
+    plan.keepAlive = {a, b, empty, s};
+    plan.cursors = {cursor};
+    plan.regions = {{0, 48000, 0, a.get()},
+                    {1000, 5800, -1000, b.get()},
+                    {0, 100000, 0, empty.get()},
+                    {0, 64000, 0, s.get(), cursor.get()}};
     std::vector<float> l(256), r(256), g(256, 0.5f);
     float* out[2] = {l.data(), r.data()};
     const long n = alloc::count([&] {
-        for (std::int64_t pos = 0; pos < 60000; pos += 256)
+        for (std::int64_t pos = 0; pos < 60000; pos += 256) {
+            notePlayPosition(plan, pos);
             renderPlan(plan, pos, 256, out, 2, g.data());
+        }
         planIsWorking(plan, 0, 256);
+        planStreamState(plan, 0, 256);
     });
     std::printf("  allocations: %ld\n", n);
     check(n == 0, "renderPlan allocated");
@@ -365,6 +421,270 @@ void testSlotStress(double seconds) {
     check(published.load() > 10 && blocks.load() > 10, "the stress test did not run");
 }
 
+// ---- Streaming the original ----
+
+// Loads everything the cursor wants (and the pool can hold)
+void fillAll(SourceStream& stream, const SourceReader& read, std::int64_t position) {
+    const std::vector<CursorState> cursors{CursorState{position, 0}};
+    for (int i = 0; i < 1000 && stream.fillOne(cursors, read) == SourceStream::Fill::Loaded; ++i) {
+    }
+}
+
+std::vector<float> streamed(const SourceStream& stream, std::int64_t pos, int n, int channel, int outChannels = 2) {
+    std::vector<std::vector<float>> out(size_t(outChannels), std::vector<float>(size_t(n), 0.0f));
+    float* ptrs[2] = {out[0].data(), outChannels > 1 ? out[1].data() : nullptr};
+    check(stream.mixInto(pos, n, ptrs, outChannels) == 0, "streamed range not all there");
+    return out[size_t(channel)];
+}
+
+void testStream() {
+    std::printf("SourceStream: the original at its own rate and at others, eviction, failures\n");
+    // Own rate: exactly the source's samples, across block edges, mono and stereo
+    for (int channels : {1, 2}) {
+        SynthSource src;
+        src.channels = channels;
+        src.length = 5 * SourceStream::kBlockFrames + 123;
+        SourceStream stream(48000, channels, src.length, 48000);
+        check(stream.length() == src.length && stream.channels() == channels, "stream shape");
+        const auto read = src.reader();
+        fillAll(stream, read, 0);
+        check(stream.ready(0, src.length), "not all read (short source)");
+        bool ok = true;
+        for (int c = 0; c < 2; ++c) {
+            const auto y = streamed(stream, SourceStream::kBlockFrames - 100, 20000, c);
+            for (size_t i = 0; i < y.size(); ++i)
+                ok = ok && y[i] == synth(std::min(c, channels - 1), SourceStream::kBlockFrames - 100 + std::int64_t(i));
+        }
+        check(ok, "own rate: not the original bit for bit");
+        // Stereo on a mono output: the mean
+        if (channels == 2) {
+            const auto m = streamed(stream, 7, 10, 0, 1);
+            check(m[3] == 0.5f * (synth(0, 10) + synth(1, 10)), "stereo stream on a mono output");
+        }
+        // The last block is partial: nothing is played past the end
+        std::vector<float> l(64, 0.0f), r(64, 0.0f);
+        float* ptrs[2] = {l.data(), r.data()};
+        check(stream.mixInto(src.length - 10, 64, ptrs, 2) == 0 && l[9] == synth(0, src.length - 1) &&
+                  l[10] == 0.0f && l[63] == 0.0f,
+              "end of the source");
+    }
+    // Another rate: what an analysed source plays there (atRate's dry), from any block
+    struct Case {
+        int from, to;
+    };
+    for (const Case k : {Case{44100, 48000}, Case{48000, 44100}, Case{16000, 48000}, Case{48000, 16000}}) {
+        SynthSource src;
+        src.length = std::int64_t(k.from) * 3 + 17;
+        Planar whole(2, std::vector<float>(size_t(src.length)));
+        for (int c = 0; c < 2; ++c)
+            for (std::int64_t i = 0; i < src.length; ++i)
+                whole[size_t(c)][size_t(i)] = synth(c, i);
+        SourceAnalysis analysis;
+        analysis.setInput(k.from, whole);
+        const auto ref = analysis.atRate(k.to);
+        SourceStream stream(k.from, 2, src.length, k.to);
+        check(ref && stream.length() == ref->length, "length at another rate");
+        if (!ref)
+            continue;
+        const auto read = src.reader();
+        double worst = 0.0;
+        // Cursors at several places, so that blocks are computed from windows in the middle too
+        for (std::int64_t at = 0; at < stream.length(); at += 7 * SourceStream::kBlockFrames)
+            fillAll(stream, read, at);
+        for (std::int64_t at = 0; at < stream.length(); at += 7 * SourceStream::kBlockFrames) {
+            const int n = int(std::min<std::int64_t>(4 * SourceStream::kBlockFrames, stream.length() - at));
+            for (int c = 0; c < 2; ++c) {
+                const auto y = streamed(stream, at, n, c);
+                const std::vector<float> r((*ref->dry)[size_t(c)].begin() + at, (*ref->dry)[size_t(c)].begin() + at + n);
+                worst = std::max(worst, relErr(y, r));
+            }
+        }
+        std::printf("  %d -> %d Hz vs the whole source through 16 kHz: %.2e\n", k.from, k.to, worst);
+        check(worst <= 1e-6, "streamed at another rate != atRate's dry");
+    }
+    check(!SourceAnalysis().atRate(48000), "sanity");
+    bool threw = false;
+    try {
+        SourceStream bad(8000, 1, 1000, 48000);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    check(threw, "an unsupported rate pair must throw (silence there, as for analysed sources)");
+
+    // Read-ahead and eviction: a long source; the pool keeps what the cursors want soonest
+    SynthSource longSrc;
+    longSrc.length = 100'000'000;
+    SourceStream stream(48000, 2, longSrc.length, 48000);
+    const auto read = longSrc.reader();
+    const std::int64_t B = SourceStream::kBlockFrames;
+    fillAll(stream, read, 10 * B + 5);
+    check(stream.ready(10 * B + 5, SourceStream::kReadAheadFrames - 5), "read ahead of the cursor");
+    check(!stream.ready(9 * B, 1) && !stream.ready(10 * B + SourceStream::kReadAheadFrames + B, 1),
+          "nothing read before the cursor or far past the read-ahead");
+    // A cursor whose region starts later than the read-ahead: nothing yet; closer: its start
+    const std::vector<CursorState> later{CursorState{50'000'000, SourceStream::kReadAheadFrames + 1}};
+    check(stream.fillOne(later, read) == SourceStream::Fill::Idle, "a region far ahead is not read yet");
+    const std::vector<CursorState> soon{CursorState{50'000'000, B}};
+    check(stream.fillOne(soon, read) == SourceStream::Fill::Loaded && stream.ready(50'000'000, 1),
+          "a region starting soon: its start is read");
+    // Many cursors: the pool (64 blocks) is shared; the nearest blocks come first
+    std::vector<CursorState> many;
+    for (int i = 0; i < 20; ++i)
+        many.push_back({std::int64_t(i) * 1000 * B, 0});
+    for (int i = 0; i < 2000 && stream.fillOne(many, read) == SourceStream::Fill::Loaded; ++i) {
+    }
+    bool nearest = true;
+    for (const auto& c : many)
+        nearest = nearest && stream.ready(c.position, B);
+    check(nearest, "with 20 cursors, each cursor's current block is read");
+    // A failed read: nothing installed, failing() until a read succeeds again (after kRetryDelay)
+    longSrc.fail = true;
+    const std::vector<CursorState> elsewhere{CursorState{80'000'000, 0}};
+    check(stream.fillOne(elsewhere, read) == SourceStream::Fill::Failed && stream.failing(), "a failed read");
+    check(stream.fillOne(elsewhere, read) == SourceStream::Fill::Idle, "no retry before the delay");
+    longSrc.fail = false;
+    std::this_thread::sleep_for(SourceStream::kRetryDelay + std::chrono::milliseconds(5));
+    check(stream.fillOne(elsewhere, read) == SourceStream::Fill::Loaded && !stream.failing() &&
+              stream.ready(80'000'000, 1),
+          "read again after the delay");
+}
+
+void testReadWholeSource() {
+    std::printf("readWholeSource: ok, too long, host failure, no access, cancel\n");
+    SynthSource src;
+    src.length = 3 * kReadChunk + 5;
+    Planar out;
+    check(readWholeSource(src.reader(), 2, src.length, out, nullptr) == LoadResult::Ok && out.size() == 2 &&
+              out[1][size_t(src.length - 1)] == synth(1, src.length - 1),
+          "read whole");
+    // Three channels: two kept (the reader writes the kept ones)
+    check(readWholeSource(src.reader(), 3, src.length, out, nullptr) == LoadResult::Ok && out.size() == 2, "kept");
+    check(readWholeSource(src.reader(), 2, kMaxSourceSamples / 2 + 1, out, nullptr) == LoadResult::TooLong &&
+              out.empty(),
+          "too long: not allocated");
+    src.fail = true;
+    check(readWholeSource(src.reader(), 2, src.length, out, nullptr) == LoadResult::Failed, "host failure");
+    src.fail = false;
+    const SourceReader none = [](std::int64_t, std::int64_t, float* const*) { return ReadStatus::NoAccess; };
+    check(readWholeSource(none, 2, src.length, out, nullptr) == LoadResult::NoAccess, "no access");
+    int chunks = 0;
+    check(readWholeSource(src.reader(), 2, src.length, out, [&](float) { return ++chunks < 2; }) ==
+              LoadResult::Cancelled,
+          "cancel");
+}
+
+#if DENOISER_COUNT_ALLOCATIONS
+// An allocation failure, as on a machine short of memory: operator new fails
+// for requests above 16 MB. The whole source can't be held; its stream can.
+void testOutOfMemory() {
+    std::printf("out of memory: the whole source can't be read into memory, its stream plays the original\n");
+    SynthSource src;
+    src.length = 10'000'000;  // 2 x 40 MB
+    Planar out;
+    alloc::failAbove = 16u << 20;
+    LoadResult result = LoadResult::Ok;
+    bool streamMade = false, original = false;
+    try {
+        result = readWholeSource(src.reader(), 2, src.length, out, nullptr);
+        SourceStream stream(48000, 2, src.length, 48000);  // 8 MB
+        streamMade = true;
+        const auto read = src.reader();
+        fillAll(stream, read, 6'000'000);
+        std::vector<float> l(4096, 0.0f), r(4096, 0.0f);
+        float* ptrs[2] = {l.data(), r.data()};
+        original = stream.mixInto(6'000'000, 4096, ptrs, 2) == 0;
+        for (int i = 0; i < 4096; ++i)
+            original = original && l[size_t(i)] == synth(0, 6'000'000 + i) && r[size_t(i)] == synth(1, 6'000'000 + i);
+    } catch (const std::bad_alloc&) {
+    }
+    alloc::failAbove = static_cast<std::size_t>(-1);
+    check(result == LoadResult::OutOfMemory && out.empty(), "the failed allocation is reported, nothing kept");
+    check(streamMade && original, "the stream plays the original within the same memory");
+}
+#endif
+
+// The streaming thread fills while audio threads render and seek: every
+// rendered sample is the original or silence (not yet read), never anything
+// else; once a position has been waited for, it plays (run under TSan / ASan)
+void testStreamStress(double seconds) {
+    std::printf("SourceStream: a reader thread fills while two audio threads render and seek, %.1f s\n", seconds);
+    SynthSource src;
+    src.length = 50'000'000;
+    auto stream = std::make_shared<SourceStream>(48000, 2, src.length, 48000);
+    auto audio = std::make_shared<SourceAudio>();
+    audio->sampleRate = 48000;
+    audio->channels = 2;
+    audio->length = stream->length();
+    audio->stream = stream;
+    auto slot = std::make_shared<AudioSlot>();
+    slot->publish(audio);
+    std::atomic<bool> stop{false};
+    std::atomic<long> loads{0}, blocks{0}, bad{0}, complete{0};
+    std::thread filler([&] {
+        std::vector<CursorState> cursors;
+        const auto read = src.reader();
+        while (!stop.load()) {
+            slot->cursorStates(cursors);
+            if (stream->fillOne(cursors, read) == SourceStream::Fill::Loaded)
+                ++loads;
+            else
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+    });
+    std::vector<std::thread> players;
+    for (int k = 0; k < 2; ++k)
+        players.emplace_back([&, k] {
+            // Two regions per plan: the source from 0 at timeline 0, and a
+            // second region of it (source from 20 M) at timeline 1 M
+            RenderPlan plan;
+            plan.keepAlive = {slot};
+            auto c0 = slot->addCursor(), c1 = slot->addCursor();
+            plan.cursors = {c0, c1};
+            plan.regions.push_back({0, src.length, 0, slot.get(), c0.get()});
+            plan.regions.push_back({1'000'000, 1'000'000 + 10'000'000, 19'000'000, slot.get(), c1.get()});
+            std::uint32_t rnd = 12345u + std::uint32_t(k);
+            std::int64_t pos = 0;
+            std::vector<float> l(256), r(256), g(256, 0.7f);
+            float* out[2] = {l.data(), r.data()};
+            while (!stop.load()) {
+                rnd = rnd * 1664525u + 1013904223u;
+                if (rnd % 200 == 0)
+                    pos = std::int64_t(rnd >> 4) % (src.length - 1000);  // seek
+                notePlayPosition(plan, pos);
+                const RenderResult res = renderPlan(plan, pos, 256, out, 2, g.data());
+                for (int i = 0; i < 256; ++i) {
+                    const std::int64_t t = pos + i;
+                    // Each region's contribution: the original or 0 (whatever the mix)
+                    const float a0 = t < src.length ? synth(0, t) : 0.0f, a1 = t < src.length ? synth(1, t) : 0.0f;
+                    const bool in1 = t >= 1'000'000 && t < 11'000'000;
+                    const float b0 = in1 ? synth(0, t + 19'000'000) : 0.0f, b1 = in1 ? synth(1, t + 19'000'000) : 0.0f;
+                    const auto okOne = [](float y, float a, float b) {
+                        return y == 0.0f || y == a || y == 0.0f + b || y == a + b;
+                    };
+                    if (!okOne(l[size_t(i)], a0, b0) || !okOne(r[size_t(i)], a1, b1))
+                        ++bad;
+                }
+                if (res.framesMissing == 0)
+                    ++complete;
+                ++blocks;
+                pos += 256;
+                if (pos + 256 > src.length)
+                    pos = 0;
+                std::this_thread::sleep_for(std::chrono::microseconds(50));  // ~5x real time
+            }
+        });
+    std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+    stop = true;
+    for (auto& t : players)
+        t.join();
+    filler.join();
+    std::printf("  %ld blocks loaded during %ld rendered blocks (%ld complete), %ld wrong samples\n", loads.load(),
+                blocks.load(), complete.load(), bad.load());
+    check(bad.load() == 0, "a rendered sample was neither the original nor silence");
+    check(loads.load() > 10 && blocks.load() > 100 && complete.load() > blocks.load() / 2,
+          "the stress test did not stream (most blocks should be complete)");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -382,6 +702,12 @@ int main(int argc, char** argv) {
         testNoAllocation();
 #endif
         testSlotStress(seconds);
+        testStream();
+        testReadWholeSource();
+#if DENOISER_COUNT_ALLOCATIONS
+        testOutOfMemory();
+#endif
+        testStreamStress(seconds);
     } catch (const std::exception& e) {
         std::printf("FAIL: exception %s\n", e.what());
         ++failures;
