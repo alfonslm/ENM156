@@ -864,7 +864,12 @@ void DenoiserDocumentController::runJob(Source& source, unsigned job) {
             message = (message.isEmpty() ? juce::String() : message + " ") + "Only the first " +
                       juce::String(enm156::ara::kMaxSourceChannels) + " of " + juce::String(channels) +
                       " channels are played.";
-        setStatus(source, source.analysis.denoised() ? SourceState::Done : SourceState::Original, 1.0f, message);
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (source.streaming == Streaming::No) {  // else it became too long meanwhile: not published
+            source.state = source.analysis.denoised() ? SourceState::Done : SourceState::Original;
+            source.progress = 1.0f;
+            source.message = message;
+        }
     } catch (const std::bad_alloc&) {
         // Nothing of it is kept in memory: its original is streamed instead
         source.analysis = enm156::ara::SourceAnalysis();
