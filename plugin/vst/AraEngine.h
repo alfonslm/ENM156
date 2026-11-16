@@ -116,6 +116,10 @@ public:
     bool ready(std::int64_t position, std::int64_t n) const noexcept;
     // True while the latest host read for this stream failed (or had no access)
     bool failing() const noexcept { return failing_.load(); }
+    // Any thread: the source's samples changed; nothing of this stream plays
+    // from now on (a new stream replaces it)
+    void invalidate() noexcept { valid_ = false; }
+    bool valid() const noexcept { return valid_.load(); }
 
     // The streaming thread (one at a time): loads at most one block, the
     // most urgent one the cursors want and the pool lacks, evicting a block
@@ -147,6 +151,7 @@ private:
     std::unique_ptr<Entry[]> entries_;
     std::vector<float> pool_;  // entry, channel, frame
     std::atomic<bool> failing_{false};
+    std::atomic<bool> valid_{true};
     std::atomic<std::int64_t> framesRead_{0};
 
     // Streaming thread only

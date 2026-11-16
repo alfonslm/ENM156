@@ -227,7 +227,10 @@ void DenoiserDocumentController::requestLocked(Source& source, unsigned needs) {
     if (source.running && (needs & (kRead | kDenoise)) != 0)
         source.cancel = true;  // the running job is out of date
     if ((needs & kRead) != 0) {
-        ++source.content;  // streamed blocks read before are out of date
+        ++source.content;  // streamed blocks read before are out of date:
+        for (auto& stream : source.streams)  // silent from now on, until replaced
+            if (stream.second && stream.second->stream)
+                stream.second->stream->invalidate();
         if (source.streaming != Streaming::No) {
             source.streamsUpToDate = false;
             streamWake_.notify_all();

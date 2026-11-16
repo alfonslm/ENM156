@@ -140,6 +140,8 @@ int SourceStream::mixInto(std::int64_t position, int n, float* const* out, int o
     std::int64_t pos = std::max<std::int64_t>(position, 0);
     const std::int64_t end = std::min(position + n, length_);
     missing += int(pos - position);
+    if (!valid_.load())
+        return missing + int(std::max<std::int64_t>(end - pos, 0));
     while (pos < end) {
         const std::int64_t block = pos / kBlockFrames;
         const std::int64_t blockEnd = std::min(end, (block + 1) * kBlockFrames);
@@ -181,6 +183,8 @@ int SourceStream::mixInto(std::int64_t position, int n, float* const* out, int o
 bool SourceStream::ready(std::int64_t position, std::int64_t n) const noexcept {
     const std::int64_t from = std::max<std::int64_t>(position, 0);
     const std::int64_t to = std::min(position + n, length_);
+    if (!valid_.load())
+        return from >= to;
     for (std::int64_t block = from / kBlockFrames; from < to && block * kBlockFrames < to; ++block) {
         bool found = false;
         for (int e = 0; e < kPoolBlocks && !found; ++e)
@@ -206,7 +210,7 @@ std::int64_t SourceStream::urgency(std::int64_t block, const std::vector<CursorS
 }
 
 SourceStream::Fill SourceStream::fillOne(const std::vector<CursorState>& cursors, const SourceReader& read) {
-    if (failing_.load() && std::chrono::steady_clock::now() < retryAt_)
+    if (!valid_.load() || (failing_.load() && std::chrono::steady_clock::now() < retryAt_))
         return Fill::Idle;
     // The most urgent block that is wanted and not in the pool
     std::int64_t want = -1, wantUrgency = INT64_MAX;

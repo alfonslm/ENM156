@@ -179,10 +179,11 @@ void testAnalysisEdges() {
 // A source of any length without its samples in memory: each sample a
 // deterministic function of (channel, position), exactly representable
 float synth(int channel, std::int64_t k, std::uint64_t seed = 0) {
-    std::uint64_t x = std::uint64_t(k) * 0x9E3779B97F4A7C15ull + std::uint64_t(channel + 1) * 0x632BE59BD9B4E019ull +
-                      seed * 0xD6E8FEB86659FD93ull;
+    std::uint64_t x = std::uint64_t(k) * std::uint64_t{0x9E3779B97F4A7C15u} +
+                      std::uint64_t(channel + 1) * std::uint64_t{0x632BE59BD9B4E019u} +
+                      seed * std::uint64_t{0xD6E8FEB86659FD93u};
     x ^= x >> 29;
-    x *= 0xBF58476D1CE4E5B9ull;
+    x *= std::uint64_t{0xBF58476D1CE4E5B9u};
     x ^= x >> 32;
     return float((x >> 40) & 0xFFFFFFu) / 16777216.0f - 0.5f;
 }

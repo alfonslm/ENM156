@@ -69,7 +69,7 @@ namespace {
 using Audio = std::vector<std::vector<float>>;  // planar
 namespace HM = juce::ARAHostModel;
 
-int failures = 0;
+std::atomic<int> failures{0};  // also counted from the plugin's threads (host reads)
 juce::String goldenDir;
 const ARA::ARAFactory* araFactory = nullptr;
 
@@ -161,12 +161,76 @@ juce::MemoryBlock settingsArchive(const juce::String& modelPath, bool highBandPa
 // ============================================================================
 // The host side of ARA
 
+// A sample of a synthesised source: a deterministic function of (seed,
+// channel, position), exactly representable as float
+float synth(int channel, std::int64_t k, std::uint64_t seed) {
+    std::uint64_t x = std::uint64_t(k) * std::uint64_t{0x9E3779B97F4A7C15u} +
+                      std::uint64_t(channel + 1) * std::uint64_t{0x632BE59BD9B4E019u} +
+                      seed * std::uint64_t{0xD6E8FEB86659FD93u};
+    x ^= x >> 29;
+    x *= std::uint64_t{0xBF58476D1CE4E5B9u};
+    x ^= x >> 32;
+    return float((x >> 40) & 0xFFFFFFu) / 16777216.0f - 0.5f;
+}
+
 struct TestSource {
     Audio data;
     double rate = 48000.0;
     juce::String id;
-    std::int64_t length() const { return data.empty() ? 0 : std::int64_t(data[0].size()); }
+    // A synthesised source (virtualLength >= 0): declared with any length,
+    // its samples made on demand by the host's reader, none held
+    std::int64_t virtualLength = -1;
+    int virtualChannels = 0;
+    std::atomic<std::uint64_t> seed{1};
+    std::int64_t length() const {
+        return virtualLength >= 0 ? virtualLength : data.empty() ? 0 : std::int64_t(data[0].size());
+    }
+    int channels() const { return virtualLength >= 0 ? virtualChannels : int(data.size()); }
+    float sample(int c, std::int64_t k) const {
+        if (k < 0 || k >= length())
+            return 0.0f;
+        return virtualLength >= 0 ? synth(c, k, seed.load()) : data[size_t(c)][size_t(k)];
+    }
 };
+
+// Host readers alive and reads made, over all documents (a document's
+// AudioAccess goes with it)
+std::atomic<int> readersAliveEverywhere{0};
+std::atomic<long> readsEverywhere{0};
+
+// A gate in front of every document's reads (one document's own gate goes
+// with its AudioAccess, so a test that destroys a document while a read
+// waits uses this one). Open by default.
+struct HostGate {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool closed = false;
+    int arrivals = 0;
+    void close() {
+        const std::lock_guard<std::mutex> lock(mutex);
+        closed = true;
+        arrivals = 0;
+    }
+    void open() {
+        {
+            const std::lock_guard<std::mutex> lock(mutex);
+            closed = false;
+        }
+        cv.notify_all();
+    }
+    bool waitForArrivals(int n) {
+        std::unique_lock<std::mutex> lock(mutex);
+        return cv.wait_for(lock, std::chrono::seconds(20), [&] { return arrivals >= n; });
+    }
+    void pass() {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (!closed)
+            return;
+        ++arrivals;
+        cv.notify_all();
+        cv.wait(lock, [&] { return !closed; });
+    }
+} hostGate;
 
 struct Reader {
     TestSource* source;
@@ -185,28 +249,37 @@ public:
             fail("the plugin asked for 64-bit samples");
         auto* reader = new Reader{SourceConverter::fromHostRef(source)};
         ++readersAlive;
+        ++readersAliveEverywhere;
         return ReaderConverter::toHostRef(reader);
     }
     bool readAudioSamples(ARA::ARAAudioReaderHostRef readerRef, ARA::ARASamplePosition position,
                           ARA::ARASampleCount count, void* const buffers[]) noexcept override {
         const TestSource& s = *ReaderConverter::fromHostRef(readerRef)->source;
+        hostGate.pass();
         waitAtGate();
         ++reads;
-        for (size_t c = 0; c < s.data.size(); ++c) {
+        ++readsEverywhere;
+        framesRead += count;
+        if (position < 0 || count < 0 || position + count > s.length())
+            fail("the plugin read outside the source");
+        if (failReads.load())
+            return false;  // e.g. a file gone offline
+        for (int c = 0; c < s.channels(); ++c) {
             auto* out = static_cast<float*>(buffers[c]);
-            for (ARA::ARASampleCount i = 0; i < count; ++i) {
-                const auto k = position + i;
-                out[i] = k >= 0 && k < s.length() ? s.data[c][size_t(k)] : 0.0f;
-            }
+            for (ARA::ARASampleCount i = 0; i < count; ++i)
+                out[i] = s.sample(c, position + i);
         }
         return true;
     }
     void destroyAudioReader(ARA::ARAAudioReaderHostRef readerRef) noexcept override {
         delete ReaderConverter::fromHostRef(readerRef);
         --readersAlive;
+        --readersAliveEverywhere;
     }
     std::atomic<int> readersAlive{0};
     std::atomic<long> reads{0};
+    std::atomic<std::int64_t> framesRead{0};
+    std::atomic<bool> failReads{false};  // every read fails while set
 
     // The host's control over its reads (a DAW's reads can be slow, e.g. from
     // disk or the network): while the gate is closed, every read waits in the
@@ -371,9 +444,19 @@ struct Document {
 
     void notify() { dc().notifyModelUpdates(); }
 
-    Source& addSource(Audio data, double rate, const juce::String& id) {
+    // A synthesised source of any length (none of its samples held)
+    Source& addVirtualSource(int sourceChannels, std::int64_t length, double rate, const juce::String& id,
+                             std::uint64_t seed = 1) {
+        auto data = std::make_unique<TestSource>();
+        data->virtualLength = length;
+        data->virtualChannels = sourceChannels;
+        data->seed = seed;
+        return addSource({}, rate, id, std::move(data));
+    }
+
+    Source& addSource(Audio data, double rate, const juce::String& id, std::unique_ptr<TestSource> made = nullptr) {
         auto s = std::make_unique<Source>();
-        s->data = std::make_unique<TestSource>();
+        s->data = made ? std::move(made) : std::make_unique<TestSource>();
         s->data->data = std::move(data);
         s->data->rate = rate;
         s->data->id = id;
@@ -382,7 +465,7 @@ struct Document {
         props.persistentID = s->data->id.toRawUTF8();
         props.sampleCount = s->data->length();
         props.sampleRate = rate;
-        props.channelCount = ARA::ARAChannelCount(s->data->data.size());
+        props.channelCount = ARA::ARAChannelCount(s->data->channels());
         props.merits64BitSamples = false;
         const juce::ARAEditGuard guard(dc());
         s->source = std::make_unique<HM::AudioSource>(SourceConverter::toHostRef(s->data.get()), dc(), props);
@@ -1018,6 +1101,370 @@ void testRenderWhileAnalysing(Host& host) {
     }
 }
 
+// ---- Sources not held in memory: their original is streamed ----
+
+// The plugin's limit (AraEngine.h kMaxSourceSamples), all channels together
+constexpr std::int64_t kLimit = 400'000'000;
+
+// Where a region plays its source, as the plugin maps it (times on whole samples)
+struct Placement {
+    const TestSource* source;
+    std::int64_t start, end, offset;  // timeline [start, end); source sample = timeline sample + offset
+};
+
+Placement place(const Document::Source& s, double startInSource, double duration, double startOnTimeline,
+                double rate) {
+    const std::int64_t start = std::llround(startOnTimeline * rate);
+    return {s.data.get(), start, std::llround((startOnTimeline + duration) * rate),
+            std::llround(startInSource * rate) - start};
+}
+
+// The original audio of the regions over timeline [start, start + n): per
+// output channel, the sum of the regions covering it, in their order (as
+// the plugin adds them); a mono source plays on every output channel
+Audio expectedOriginal(const std::vector<Placement>& regions, std::int64_t start, std::int64_t n, int outChannels) {
+    Audio out(size_t(outChannels), std::vector<float>(size_t(n), 0.0f));
+    for (int c = 0; c < outChannels; ++c)
+        for (std::int64_t i = 0; i < n; ++i) {
+            float acc = 0.0f;
+            for (const auto& r : regions) {
+                const std::int64_t t = start + i;
+                if (t >= r.start && t < r.end)
+                    acc += r.source->sample(std::min(c, r.source->channels() - 1), t + r.offset);
+            }
+            out[size_t(c)][size_t(i)] = acc;
+        }
+    return out;
+}
+
+bool sameAudio(const Audio& a, const Audio& b) {
+    for (size_t c = 0; c < a.size(); ++c)
+        if (!sameSamples(a[c], 0, b[c], 0, a[c].size()))
+            return false;
+    return true;
+}
+
+// Realtime, in the prepared renderer: plays timeline [start, start + n)
+// again and again (a host looping over it) until it is `expected` bit for
+// bit, as it must be once the read-ahead has caught up. With `strict`, every
+// sample of every pass must be the expected one or silence (not read yet).
+// False after 20 s.
+bool playsOriginal(Document& doc, double rate, std::int64_t start, const Audio& expected, const juce::String& what,
+                   bool strict = true) {
+    const auto n = std::int64_t(expected[0].size());
+    int passes = 0;
+    for (const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+         std::chrono::steady_clock::now() < until; ++passes) {
+        const Audio out = doc.renderPrepared(rate, start, n, 512);
+        if (sameAudio(out, expected)) {
+            std::printf("  %s: the original, bit for bit, after %d pass(es)\n", what.toRawUTF8(), passes + 1);
+            return true;
+        }
+        if (strict)
+            for (size_t c = 0; c < out.size(); ++c)
+                for (size_t i = 0; i < out[c].size(); ++i)
+                    if (!juce::exactlyEqual(out[c][i], expected[c][i]) && !juce::exactlyEqual(out[c][i], 0.0f)) {
+                        fail(what + ": a sample neither the original nor silence, at " + juce::String(start + std::int64_t(i)));
+                        return false;
+                    }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    fail(what + ": not the original after 20 s");
+    return false;
+}
+
+void prepareRealtime(Document& doc, double rate) {
+    doc.plugin->releaseResources();
+    doc.plugin->setNonRealtime(false);
+    doc.plugin->setRateAndBufferSizeDetails(rate, 4096);
+    doc.plugin->prepareToPlay(rate, 4096);
+}
+
+juce::AudioProcessorParameter* findParameter(Document& doc, const juce::String& name) {
+    for (auto* p : doc.plugin->getParameters())
+        if (p->getName(20) == name)
+            return p;
+    return nullptr;
+}
+
+// A stereo source over the limit: the original plays (streamed), from the
+// start, the middle, after seeks, to its end; offline renders are complete;
+// mix and bypass; content update and sample access off and on; archive
+void testTooLong(Host& host) {
+    std::printf("a source over the limit plays its original, streamed (48 kHz stereo, %lld frames)\n",
+                (long long)(kLimit / 2 + 1));
+    const juce::String path = golden("mlp_magnitude_default.model.bin");
+    auto doc = host.createDocument(2);
+    if (!doc)
+        return;
+    const double rate = 48000;
+    const std::int64_t len = kLimit / 2 + 1;
+    auto& src = doc->addVirtualSource(2, len, rate, "long-stereo");
+    doc->addRegion(src, 0.0, double(len) / rate, 0.0);
+    check(doc->restore(settingsArchive(path)), "restore");  // a model: not used for this source
+    const std::vector<Placement> whole{place(src, 0.0, double(len) / rate, 0.0, rate)};
+    juce::String status = sourceStatus(*doc->plugin);
+    std::printf("  %s\n", status.toRawUTF8());
+    check(status.contains("long-stereo: original (streamed) Too long to analyse"), "status: " + status);
+
+    prepareRealtime(*doc, rate);
+    for (const std::int64_t at : {std::int64_t(0), std::int64_t(100'000'000), std::int64_t(50'000'000),
+                                  std::int64_t(150'000'000)})
+        playsOriginal(*doc, rate, at, expectedOriginal(whole, at, 24000, 2),
+                      "realtime from " + juce::String(at) + (at == 50'000'000 ? " (seek back)" : at == 150'000'000 ? " (seek forward)" : ""));
+    // The end of the source: the original, then silence
+    playsOriginal(*doc, rate, len - 9000, expectedOriginal(whole, len - 9000, 8990, 2), "realtime to the end");
+    Audio out = doc->renderPrepared(rate, len + 10, 20000);
+    check(isSilent(out[0], 0, 20000) && isSilent(out[1], 0, 20000), "past the end: silence");
+    const std::int64_t read = doc->access->framesRead.load();
+    std::printf("  frames read from the host so far: %lld (the source has %lld)\n", (long long)read, (long long)len);
+    check(read < len / 20, "the plugin read far more of the source than it played");
+
+    // Offline: complete from its first sample, at a place never played
+    out = doc->render(rate, 170'000'000, 200'000, false);
+    check(sameAudio(out, expectedOriginal(whole, 170'000'000, 200'000, 2)), "offline render: not the complete original");
+
+    // Mix and bypass: the original whatever they are (there is no denoised signal)
+    auto* mix = findParameter(*doc, "Mix");
+    auto* bypass = doc->plugin->getBypassParameter();
+    if (mix == nullptr || bypass == nullptr) {
+        fail("no mix / bypass parameter");
+    } else {
+        setParameter(*doc, *mix, 0.5f, rate);
+        out = doc->render(rate, 120'000'000, 30'000, false);
+        check(sameAudio(out, expectedOriginal(whole, 120'000'000, 30'000, 2)), "mix 0.5: not the original");
+        setParameter(*doc, *mix, 1.0f, rate);
+        setParameter(*doc, *bypass, 1.0f, rate);
+        out = doc->render(rate, 120'000'000, 30'000, false);
+        check(sameAudio(out, expectedOriginal(whole, 120'000'000, 30'000, 2)), "bypass: not the original");
+        setParameter(*doc, *bypass, 0.0f, rate);
+    }
+
+    // Sample access off while it plays: what is read keeps playing, nothing
+    // else appears; the host changes the samples, access on, content update:
+    // the new samples play
+    prepareRealtime(*doc, rate);
+    const std::int64_t at = 80'000'000;
+    playsOriginal(*doc, rate, at, expectedOriginal(whole, at, 24000, 2), "before sample access is switched off");
+    src.source->enableAudioSourceSamplesAccess(false);
+    out = doc->renderPrepared(rate, at, 24000);
+    check(sameAudio(out, expectedOriginal(whole, at, 24000, 2)), "access off: what was read stops playing");
+    out = doc->renderPrepared(rate, 30'000'000, 24000);  // never read: silence (no access)
+    check(isSilent(out[0], 0, 24000), "access off: something not read yet plays");
+    src.data->seed = 2;
+    src.source->enableAudioSourceSamplesAccess(true);
+    {
+        const juce::ARAEditGuard guard(doc->dc());
+        doc->dc().updateAudioSourceContent(src.source->getPluginRef(), nullptr,
+                                           ARA::ContentUpdateScopes::samplesAreAffected());
+    }
+    playsOriginal(*doc, rate, at, expectedOriginal(whole, at, 24000, 2), "after access on and a content update (new samples)");
+
+    // Store; a new document restores it (the source is streamed again)
+    const juce::MemoryBlock archive = doc->store();
+    auto doc2 = host.createDocument(2);
+    if (!doc2)
+        return;
+    auto& src2 = doc2->addVirtualSource(2, len, rate, "long-stereo", 2);
+    doc2->addRegion(src2, 0.0, double(len) / rate, 0.0);
+    check(doc2->restore(archive), "restoring the archive");
+    out = doc2->render(rate, 100'000'000, 30'000, false);
+    check(sameAudio(out, expectedOriginal({place(src2, 0.0, double(len) / rate, 0.0, rate)}, 100'000'000, 30'000, 2)),
+          "restored: not the original");
+    check(sourceStatus(*doc2->plugin).contains("Too long"), "restored status: " + sourceStatus(*doc2->plugin));
+    check(araMessage(*doc2->plugin, "modelPath") == path, "restored model path");
+}
+
+// A mono source over the limit: a moved and trimmed region, and a second
+// region of it playing at the same time (the two add up)
+void testTooLongRegions(Host& host) {
+    std::printf("a source over the limit: moved and trimmed region, two regions at once (48 kHz mono)\n");
+    auto doc = host.createDocument(2);
+    if (!doc)
+        return;
+    const double rate = 48000;
+    auto& src = doc->addVirtualSource(1, kLimit + 1, rate, "long-mono");
+    doc->addRegion(src, 1000.0, 10.0, 5.0);  // source 1000-1010 s at 5 s
+    doc->addRegion(src, 3000.0, 5.0, 7.0);   // source 3000-3005 s at 7 s
+    const std::vector<Placement> regions{place(src, 1000.0, 10.0, 5.0, rate), place(src, 3000.0, 5.0, 7.0, rate)};
+    check(sourceStatus(*doc->plugin).contains("Too long"), "status: " + sourceStatus(*doc->plugin));
+    // Offline: silence before the region, its start; both regions and the second's end
+    Audio out = doc->render(rate, 230'000, 20'000, false);
+    check(sameAudio(out, expectedOriginal(regions, 230'000, 20'000, 2)), "moved + trimmed region (offline)");
+    out = doc->render(rate, 500'000, 100'000, false);
+    check(sameAudio(out, expectedOriginal(regions, 500'000, 100'000, 2)), "two regions at once (offline)");
+    // Realtime, both regions
+    prepareRealtime(*doc, rate);
+    playsOriginal(*doc, rate, 330'000, expectedOriginal(regions, 330'000, 24'000, 2), "two regions at once, realtime",
+                  false);
+}
+
+// A host whose reads fail: the original plays once they succeed again; a
+// content update then analyses the source as usual
+void testReadFailure(Host& host) {
+    std::printf("the host fails to read a source: its original plays once reads succeed\n");
+    const juce::String path = golden("mlp_magnitude_default.model.bin");
+    auto model = loadModel(path);
+    auto doc = host.createDocument(2);
+    if (!doc || !model)
+        return;
+    doc->access->failReads = true;
+    check(doc->restore(settingsArchive(path)), "restore");
+    const Audio data = noise(2, 48000, 17);
+    auto& src = doc->addSource(data, 48000, "unreadable");
+    doc->addRegion(src, 0.0, 1.0, 0.0);
+    pollUpdates(*doc, [&] { return sourceStatus(*doc->plugin).contains("could not read"); });
+    const juce::String status = sourceStatus(*doc->plugin);
+    std::printf("  %s\n", status.toRawUTF8());
+    check(status.contains("unreadable: original (streamed) The host could not read"), "status: " + status);
+    prepareRealtime(*doc, 48000);
+    Audio out = doc->renderPrepared(48000, 0, 24000);
+    check(isSilent(out[0], 0, 24000), "nothing read, yet something plays");
+    doc->access->failReads = false;
+    const std::vector<Placement> whole{place(src, 0.0, 1.0, 0.0, 48000)};
+    playsOriginal(*doc, 48000, 0, expectedOriginal(whole, 0, 24000, 2), "once the host's reads succeed again");
+    // The source changes (the host can read it now): analysed and denoised as usual
+    {
+        const juce::ARAEditGuard guard(doc->dc());
+        doc->dc().updateAudioSourceContent(src.source->getPluginRef(), nullptr,
+                                           ARA::ContentUpdateScopes::samplesAreAffected());
+    }
+    out = doc->render(48000, 0, 48000, false);
+    Audio ref;
+    for (const auto& ch : data)
+        ref.push_back(reference(*model, 48000, ch));
+    const double err = compareChannels(out, ref, 0, 0, 48000);
+    std::printf("  after a content update: denoised, error %.2e; %s\n", err, sourceStatus(*doc->plugin).toRawUTF8());
+    check(err <= kTolerance, "after the content update: not denoised, error " + juce::String(err));
+}
+
+// A source over the limit at 44.1 kHz played at 48 kHz: its original through
+// 16 kHz, as an analysed source's original plays there
+void testTooLongOtherRate(Host& host) {
+    std::printf("a source over the limit at 44.1 kHz played at 48 kHz\n");
+    auto doc = host.createDocument(2);
+    if (!doc)
+        return;
+    const std::int64_t len = kLimit / 2 + 1;
+    auto& src = doc->addVirtualSource(2, len, 44100, "long-44");
+    doc->addRegion(src, 0.0, double(len) / 44100.0, 0.0);
+    const std::int64_t at = 90'000'000, n = 30'000;  // timeline frames at 48 kHz
+    const Audio out = doc->render(48000, at, n, false);
+    // Reference: through 16 kHz over a wide window around it (16 kHz j is at
+    // 44.1 kHz sample j * 441 / 160 and at 48 kHz sample 3 j)
+    auto in44 = denoiser::ResampleFilter::create(44100);
+    auto out48 = denoiser::ResampleFilter::create(48000);
+    const std::int64_t j0 = at / 3 - 2000, j1 = (at + n) / 3 + 2000;
+    const std::int64_t s0 = (j0 - 2000) * 441 / 160 / 441 * 441, s1 = (j1 + 2000) * 441 / 160;
+    const std::int64_t jStart = s0 * 160 / 441;
+    double worst = 0.0;
+    for (int c = 0; c < 2; ++c) {
+        std::vector<float> x(size_t(s1 - s0));
+        for (std::int64_t i = 0; i < s1 - s0; ++i)
+            x[size_t(i)] = src.data->sample(c, s0 + i);
+        const auto x16 = denoiser::clipToModelRate(*in44, x.data(), x.size());
+        const auto y = denoiser::clipFromModelRate(*out48, x16.data() + (j0 - jStart), size_t(j1 - j0),
+                                                   size_t(at + n - 3 * j0));
+        worst = std::max(worst, relErr(out[size_t(c)], 0, y, size_t(at - 3 * j0), size_t(n)));
+    }
+    std::printf("  vs the core through 16 kHz: %.2e\n", worst);
+    check(worst <= kTolerance, "a long 44.1 kHz source at 48 kHz: error " + juce::String(worst));
+}
+
+int countThreads() {
+#if defined(__linux__)
+    juce::StringArray lines;
+    lines.addLines(juce::File("/proc/self/status").loadFileAsString());
+    for (const auto& line : lines)
+        if (line.startsWith("Threads:"))
+            return line.fromFirstOccurrenceOf(":", false, false).trim().getIntValue();
+#endif
+    return -1;
+}
+
+// The document is destroyed while the plugin's streaming read waits in the
+// host: destruction waits for that read, and afterwards no plugin thread is
+// left and nothing reads or holds a reader
+void testDestroyWhileReading(Host& host) {
+    std::printf("the document is destroyed while a streaming read is in the host\n");
+    const int threadsBefore = countThreads();
+    {
+        auto doc = host.createDocument(2);
+        if (!doc)
+            return;
+        auto& src = doc->addVirtualSource(2, kLimit, 48000, "long-destroyed");
+        doc->addRegion(src, 0.0, double(kLimit / 2) / 48000.0, 0.0);
+        prepareRealtime(*doc, 48000);
+        hostGate.close();
+        doc->renderPrepared(48000, 60'000'000, 512);  // the plugin starts reading there
+        if (!hostGate.waitForArrivals(1)) {
+            hostGate.open();
+            fail("the plugin did not read");
+            return;
+        }
+        // The document is destroyed on its own thread (ARA's rule); the read
+        // it waits for returns 100 ms later, as a slow host read would
+        std::atomic<bool> destroyed{false};
+        std::atomic<bool> openedBeforeDestroyed{false};
+        std::thread slowRead([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            openedBeforeDestroyed = !destroyed.load();
+            hostGate.open();
+        });
+        doc.reset();
+        destroyed = true;
+        slowRead.join();
+        std::printf("  destruction %s for the read in the host\n",
+                    openedBeforeDestroyed.load() ? "waited" : "did not wait");
+    }
+    const long reads = readsEverywhere.load();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    check(readsEverywhere.load() == reads, "something read after the document was destroyed");
+    check(readersAliveEverywhere.load() == 0, "host readers left: " + juce::String(readersAliveEverywhere.load()));
+    const int threadsAfter = countThreads();
+    std::printf("  threads before %d, after %d\n", threadsBefore, threadsAfter);
+    check(threadsAfter <= threadsBefore, "threads left running after the document was destroyed");
+}
+
+#if DENOISER_COUNT_WRAPPER_ALLOCATIONS
+// No allocation in the realtime render call while a source is streamed and
+// the streaming thread reads (including a seek)
+void testStreamAllocations(Host& host) {
+    std::printf("allocations while rendering a streamed source through the VST3 interface\n");
+    auto doc = host.createDocument(2);
+    if (!doc)
+        return;
+    auto& src = doc->addVirtualSource(2, kLimit / 2 + 1, 48000, "long-alloc");
+    doc->addRegion(src, 0.0, double(kLimit / 2) / 48000.0, 0.0);
+    prepareRealtime(*doc, 48000);
+    std::vector<float> left(512), right(512);
+    float* ptrs[] = {left.data(), right.data()};
+    juce::MidiBuffer midi;
+    juce::Random random(5);
+    doc->playHead.time = 10'000'000;
+    const std::int64_t readBefore = doc->access->framesRead.load();
+    long complete = 0;
+    const long count = alloc::countOnThisThread([&] {
+        for (int b = 0; b < 400; ++b) {
+            const int n = 1 + random.nextInt(512);
+            juce::AudioBuffer<float> buffer(ptrs, 2, n);
+            if (b == 200)
+                doc->playHead.time = 120'000'000;  // seek
+            doc->plugin->processBlock(buffer, midi);
+            if (!juce::exactlyEqual(left[size_t(n - 1)], 0.0f))
+                ++complete;
+            doc->playHead.time += n;
+            std::this_thread::sleep_for(std::chrono::microseconds(300));
+        }
+    });
+    const std::int64_t read = doc->access->framesRead.load() - readBefore;
+    std::printf("  %ld allocations; %lld frames read meanwhile; %ld of 400 blocks with audio\n", count,
+                (long long)read, complete);
+    check(count == 0, "streamed ARA rendering allocated " + juce::String(count) + " times");
+    check(read > 0 && complete > 0, "nothing was streamed during the count");
+}
+#endif
+
 #if DENOISER_COUNT_WRAPPER_ALLOCATIONS
 void testAllocations(Host& host) {
     std::printf("allocations while rendering ARA regions through the VST3 interface\n");
@@ -1118,8 +1565,14 @@ int main(int argc, char** argv) {
         testOtherPlaybackRate(host);
         testEdgeSources(host);
         testRenderWhileAnalysing(host);
+        testTooLong(host);
+        testTooLongRegions(host);
+        testReadFailure(host);
+        testTooLongOtherRate(host);
+        testDestroyWhileReading(host);
 #if DENOISER_COUNT_WRAPPER_ALLOCATIONS
         testAllocations(host);
+        testStreamAllocations(host);
 #endif
     } catch (const std::exception& e) {
         fail(juce::String("exception: ") + e.what());
@@ -1127,6 +1580,6 @@ int main(int argc, char** argv) {
 
     host.factory = {};  // releases the plugin's ARA factory while the module is loaded
     host.keepLoaded.reset();
-    std::printf(failures == 0 ? "all checks passed\n" : "%d check(s) failed\n", failures);
+    std::printf(failures == 0 ? "all checks passed\n" : "%d check(s) failed\n", failures.load());
     return failures == 0 ? 0 : 1;
 }
