@@ -1,6 +1,6 @@
 // The ARA engine below the ARA interface (AraEngine.h), no JUCE, no host:
 //
-//   denoiser_ara_engine_test <golden dir> [stress seconds (the stream stress: half)]
+//   denoiser_ara_engine_test <golden dir> [stress seconds (the stream stress: 5000 blocks per player each)]
 //
 //   - SourceAnalysis: the stored audio equals the core's denoiseClipAtRate
 //     (16, 44.1, 48 kHz; causal and centred models; both high-band choices);
@@ -19,6 +19,7 @@
 #include "denoiser/offline.h"
 #include "denoiser/offline_rate.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -411,7 +412,16 @@ void testSlotStress(double seconds) {
                 ++blocks;
             }
         });
-    std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+    // At least `seconds`, and then until a minimum of work is done (a
+    // publication waits for readers in steps of a short sleep, which lasts a
+    // timer tick, ~15 ms, on Windows), bounded so that it cannot hang
+    const auto start = std::chrono::steady_clock::now();
+    const auto minimum = start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                     std::chrono::duration<double>(seconds));
+    const auto deadline = minimum + std::chrono::seconds(60);
+    std::this_thread::sleep_until(minimum);  // sleeping longer only adds work
+    while (std::chrono::steady_clock::now() < deadline && (published.load() < 20 || blocks.load() < 20))
+        std::this_thread::yield();
     stop = true;
     writer.join();
     for (auto& t : readers)
@@ -419,7 +429,7 @@ void testSlotStress(double seconds) {
     std::printf("  %ld publications during %ld blocks, %ld torn blocks\n", published.load(), blocks.load(),
                 bad.load());
     check(bad.load() == 0, "a block mixed two publications");
-    check(published.load() > 10 && blocks.load() > 10, "the stress test did not run");
+    check(published.load() >= 20 && blocks.load() >= 20, "the stress test did not run (60 s after its time)");
 }
 
 // ---- Streaming the original ----
@@ -606,9 +616,21 @@ void testOutOfMemory() {
 
 // The streaming thread fills while audio threads render and seek: every
 // rendered sample is the original or silence (not yet read), never anything
-// else; once a position has been waited for, it plays (run under TSan / ASan)
-void testStreamStress(double seconds) {
-    std::printf("SourceStream: a reader thread fills while two audio threads render and seek, %.1f s\n", seconds);
+// else; once a position has been waited for, it plays (run under TSan / ASan).
+//
+// A fixed amount of work, not a fixed time, and no sleep_for anywhere: how
+// long a short sleep lasts depends on the platform's timer (about 15 ms on
+// Windows), which once made this test fail there for lack of work done. The
+// players render as fast as they can; every kSyncEvery blocks a player waits
+// (yielding, against a steady_clock deadline) until the stream holds what it
+// plays next, and that block must then be complete. Nothing asserted
+// depends on how fast threads run, only on what they did.
+void testStreamStress(int blocksPerPlayer) {
+    std::printf("SourceStream: a reader thread fills while two audio threads render and seek, %d blocks each\n",
+                blocksPerPlayer);
+    constexpr int kSyncEvery = 500;
+    // Bounds the whole run, so that a stuck stream fails instead of hanging CI
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
     SynthSource src;
     src.length = 50'000'000;
     auto stream = std::make_shared<SourceStream>(48000, 2, src.length, 48000);
@@ -620,7 +642,7 @@ void testStreamStress(double seconds) {
     auto slot = std::make_shared<AudioSlot>();
     slot->publish(audio);
     std::atomic<bool> stop{false};
-    std::atomic<long> loads{0}, blocks{0}, bad{0}, complete{0};
+    std::atomic<long> loads{0}, blocks{0}, bad{0}, complete{0}, played{0}, syncs{0}, syncMisses{0}, timedOut{0};
     std::thread filler([&] {
         std::vector<CursorState> cursors;
         const auto read = src.reader();
@@ -629,7 +651,7 @@ void testStreamStress(double seconds) {
             if (stream->fillOne(cursors, read) == SourceStream::Fill::Loaded)
                 ++loads;
             else
-                std::this_thread::sleep_for(std::chrono::microseconds(200));
+                std::this_thread::yield();
         }
     });
     std::vector<std::thread> players;
@@ -647,12 +669,32 @@ void testStreamStress(double seconds) {
             std::int64_t pos = 0;
             std::vector<float> l(256), r(256), g(256, 0.7f);
             float* out[2] = {l.data(), r.data()};
-            while (!stop.load()) {
+            for (int n = 0; n < blocksPerPlayer; ++n) {
                 rnd = rnd * 1664525u + 1013904223u;
                 if (rnd % 200 == 0)
                     pos = std::int64_t(rnd >> 4) % (src.length - 1000);  // seek
                 notePlayPosition(plan, pos);
+                const bool sync = n % kSyncEvery == kSyncEvery - 1;
+                if (sync) {
+                    // Wait until both regions' audio for this block is there
+                    const bool in1 = pos + 256 > 1'000'000 && pos < 11'000'000;
+                    const auto ready = [&] {
+                        return stream->ready(pos, 256) &&
+                               (!in1 || stream->ready(std::max<std::int64_t>(pos, 1'000'000) + 19'000'000,
+                                                      std::min<std::int64_t>(pos + 256, 11'000'000) -
+                                                          std::max<std::int64_t>(pos, 1'000'000)));
+                    };
+                    while (!ready() && std::chrono::steady_clock::now() < deadline)
+                        std::this_thread::yield();
+                    ++syncs;
+                }
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    ++timedOut;
+                    break;
+                }
                 const RenderResult res = renderPlan(plan, pos, 256, out, 2, g.data());
+                if (sync && res.framesMissing != 0)
+                    ++syncMisses;
                 for (int i = 0; i < 256; ++i) {
                     const std::int64_t t = pos + i;
                     // Each region's contribution: the original or 0 (whatever the mix)
@@ -664,6 +706,8 @@ void testStreamStress(double seconds) {
                     };
                     if (!okOne(l[size_t(i)], a0, b0) || !okOne(r[size_t(i)], a1, b1))
                         ++bad;
+                    else if (l[size_t(i)] != 0.0f && l[size_t(i)] == a0 + b0)
+                        ++played;  // the full original, not silence
                 }
                 if (res.framesMissing == 0)
                     ++complete;
@@ -671,19 +715,23 @@ void testStreamStress(double seconds) {
                 pos += 256;
                 if (pos + 256 > src.length)
                     pos = 0;
-                std::this_thread::sleep_for(std::chrono::microseconds(50));  // ~5x real time
             }
         });
-    std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
-    stop = true;
     for (auto& t : players)
         t.join();
+    const long loadsWhilePlaying = loads.load();  // the filler ran concurrently with the players
+    stop = true;
     filler.join();
-    std::printf("  %ld blocks loaded during %ld rendered blocks (%ld complete), %ld wrong samples\n", loads.load(),
-                blocks.load(), complete.load(), bad.load());
+    std::printf("  %ld blocks loaded during %ld rendered blocks (%ld complete, %ld waited for, %ld original samples "
+                "played), %ld wrong samples\n",
+                loadsWhilePlaying, blocks.load(), complete.load(), syncs.load(), played.load(), bad.load());
     check(bad.load() == 0, "a rendered sample was neither the original nor silence");
-    check(loads.load() > 10 && blocks.load() > 100 && complete.load() > blocks.load() / 2,
-          "the stress test did not stream (most blocks should be complete)");
+    check(timedOut.load() == 0, "the stress test did not finish within 60 s (a waited-for block never arrived?)");
+    check(blocks.load() == 2L * blocksPerPlayer && syncs.load() == 2L * (blocksPerPlayer / kSyncEvery),
+          "not every block was rendered");
+    check(syncMisses.load() == 0, "a block the stream said was ready was not complete");
+    check(loadsWhilePlaying > 0 && complete.load() >= syncs.load() && played.load() > 0,
+          "nothing was streamed while the players rendered");
 }
 
 }  // namespace
@@ -708,7 +756,8 @@ int main(int argc, char** argv) {
 #if DENOISER_COUNT_ALLOCATIONS
         testOutOfMemory();
 #endif
-        testStreamStress(seconds / 2);
+        // A fixed amount of work: 5000 blocks per player per "second" asked
+        testStreamStress(int(5000 * std::max(1.0, seconds)));
     } catch (const std::exception& e) {
         std::printf("FAIL: exception %s\n", e.what());
         ++failures;

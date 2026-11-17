@@ -1467,7 +1467,12 @@ void testStreamAllocations(Host& host) {
             if (!juce::exactlyEqual(left[size_t(n - 1)], 0.0f))
                 ++complete;
             doc->playHead.time += n;
-            std::this_thread::sleep_for(std::chrono::microseconds(300));
+            // About 300 us per block, so that the streaming thread reads
+            // meanwhile; by the clock, not a short sleep (whose length depends
+            // on the platform's timer)
+            for (const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(300);
+                 std::chrono::steady_clock::now() < until;)
+                std::this_thread::yield();
         }
     });
     const std::int64_t read = doc->access->framesRead.load() - readBefore;
