@@ -20,6 +20,9 @@ inline std::atomic<bool> armed{false};
 inline std::atomic<long> allocations{0};
 inline std::atomic<bool> oneThread{false};
 inline std::thread::id countedThread;  // written only while not armed
+// operator new throws std::bad_alloc for larger requests (a machine short of
+// memory, for tests of what happens then); no limit by default
+inline std::atomic<std::size_t> failAbove{static_cast<std::size_t>(-1)};
 
 inline void note() {
     if (armed.load(std::memory_order_relaxed) &&
@@ -65,6 +68,8 @@ inline void* allocate(std::size_t n) {
 #if !HOOK_MALLOC
     note();
 #endif
+    if (n > failAbove.load(std::memory_order_relaxed))
+        throw std::bad_alloc();
     if (void* p = std::malloc(n ? n : 1))
         return p;
     throw std::bad_alloc();
