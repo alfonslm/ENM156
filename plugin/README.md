@@ -824,6 +824,11 @@ only on Linux/glibc).
   in a bounce. The streaming thread looks at the cursors every 2 ms while a
   source is streamed. A source whose own rate is unsupported plays silence at
   other playback rates.
+- That 2 ms poll is a timed wait, which on Windows can last a timer tick
+  (about 15 ms): there the gap of silence after a seek on a streamed source
+  may be around 15 ms plus one host read, against a few ms elsewhere. This is
+  unmeasured on Windows; if it proves audible, a high-resolution timer for
+  the streaming thread's wait would be the fix.
 - The analysis uses one thread per document.
 - Logic (ARA through Audio Units) is out of scope (no AU target).
 - The host's document thread is assumed to be the message thread when the
